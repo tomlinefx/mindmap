@@ -37,10 +37,21 @@ public static class Apps
 
     public static string ListJson() => JsonSerializer.Serialize(List(), new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
 
-    /// <summary>`--app` の id（実行ファイル名）から、いま動いているプロセスの PID を引く。無ければ null。</summary>
+    /// <summary>
+    /// `--app` の id（実行ファイル名）から、Process Loopback の対象にする PID を引く。音声セッションを持つプロセス（音を出している側）を優先し、
+    /// 無ければ同じ名前のうち最初に始まったもの（会議アプリの親。子プロセスの音は INCLUDE_TARGET_PROCESS_TREE で一緒に取れる）。動いていなければ null。
+    /// </summary>
     public static int? ResolvePid(string id)
     {
         var name = id.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? id[..^4] : id;
-        return Process.GetProcessesByName(name).Select(p => (int?)p.Id).FirstOrDefault();
+        var withSession = List().FirstOrDefault(a => string.Equals(a.id, name + ".exe", StringComparison.OrdinalIgnoreCase));
+        if (withSession is not null) return withSession.pid;
+        return Process.GetProcessesByName(name).OrderBy(StartTimeOf).Select(p => (int?)p.Id).FirstOrDefault();
+    }
+
+    private static DateTime StartTimeOf(Process process)
+    {
+        try { return process.StartTime; }
+        catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException) { return DateTime.MaxValue; } // 権限が無い・もう終わった
     }
 }

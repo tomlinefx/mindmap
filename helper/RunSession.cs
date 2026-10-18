@@ -34,7 +34,8 @@ public sealed class RunSession
 
     public async Task<int> Run(CancellationToken cancel)
     {
-        if (Apps.ResolvePid(app) is null) Console.Error.WriteLine($"会議アプリ {app} は動いていません。音は既定の再生デバイス全体から取ります");
+        var pid = Apps.ResolvePid(app);
+        if (pid is null) Console.Error.WriteLine($"会議アプリ {app} は動いていません。音は既定の再生デバイス全体から取ります");
         var exit = new TaskCompletionSource<int>();
         Capture? self = null;
         Capture? other = null;
@@ -69,7 +70,7 @@ public sealed class RunSession
             try
             {
                 self = Capture.Microphone();
-                other = Capture.Loopback();
+                other = pid is int target ? Capture.ProcessLoopback(target) : Capture.Loopback();
             }
             catch (Exception e) when (e is NAudio.MmException or System.Runtime.InteropServices.COMException or InvalidOperationException)
             {
@@ -103,7 +104,8 @@ public sealed class RunSession
             selfCapture.Start();
             otherCapture.Start();
             if (selfPaused) SendSelfPause(true);
-            Console.Error.WriteLine($"取得を始めました（自分: マイク、相手: 再生デバイスの loopback、ポート {port}）");
+            var otherSource = pid is int p ? $"{app}（PID {p}）の Process Loopback" : "再生デバイスの loopback";
+            Console.Error.WriteLine($"取得を始めました（自分: マイク、相手: {otherSource}、ポート {port}）");
 
             using var registration = cancel.Register(() => exit.TrySetResult(0));
             var code = await exit.Task;

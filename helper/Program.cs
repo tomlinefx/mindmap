@@ -56,9 +56,9 @@ switch (command)
     }
     case "capture-wav":
     {
-        // 開発用: 取得を確かめる。capture-wav self|other <秒> <out.wav>
-        if (args.Length < 4 || !int.TryParse(args[2], out var seconds)) { Console.Error.WriteLine("capture-wav self|other <秒> <out.wav>"); return 2; }
-        return CaptureFile.Run(args[1], seconds, args[3]);
+        // 開発用: 取得を確かめる。capture-wav self|other <秒> <out.wav> [<app id>]
+        if (args.Length < 4 || !int.TryParse(args[2], out var seconds)) { Console.Error.WriteLine("capture-wav self|other <秒> <out.wav> [<app id>]"); return 2; }
+        return CaptureFile.Run(args[1], seconds, args[3], args.Length > 4 ? args[4] : null);
     }
     default:
         Console.Error.WriteLine("使い方: mindmap-helper <list|check|run ...|stt-file <wav>|capture-wav ...>");

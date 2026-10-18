@@ -6,14 +6,13 @@ namespace Mindmap.Helper.Audio;
 
 /// <summary>
 /// 1 トラック分の音声取得。WASAPI の形式（たいてい 48 kHz・float・ステレオ）を 16 kHz・モノラルの float にして OnSamples へ渡す。
-/// 自分: マイク（WasapiCapture）。相手: 会議アプリの音。
-/// TODO(ADR 0001): 相手は Process Loopback（会議アプリのプロセスだけ）にする。いまは既定の再生デバイス全体の loopback（通知音なども混ざる）。
+/// 自分: マイク（WasapiCapture）。相手: 会議アプリのプロセスの音（ProcessLoopbackCapture）。会議アプリが動いていないときだけ既定の再生デバイス全体の loopback。
 /// </summary>
 public sealed class Capture : IDisposable
 {
     public const int TargetRate = 16_000;
 
-    private readonly WasapiCapture capture;
+    private readonly IWaveIn capture;
     private readonly Resampler resampler;
     private readonly object gate = new();
     private bool paused;
@@ -27,7 +26,7 @@ public sealed class Capture : IDisposable
     /// <summary>取得が予期せず止まった（機器が外れた等）。</summary>
     public event Action<Exception?>? OnStopped;
 
-    private Capture(WasapiCapture capture)
+    private Capture(IWaveIn capture)
     {
         this.capture = capture;
         resampler = new Resampler(capture.WaveFormat, TargetRate);
@@ -37,6 +36,10 @@ public sealed class Capture : IDisposable
 
     public static Capture Microphone() => new(new WasapiCapture());
 
+    /// <summary>会議アプリのプロセス（とその子プロセス）の音だけ。</summary>
+    public static Capture ProcessLoopback(int pid) => new(new ProcessLoopbackCapture(pid));
+
+    /// <summary>既定の再生デバイス全体の音（通知音なども混ざる）。会議アプリが動いていないときの代わり。</summary>
     public static Capture Loopback() => new(new WasapiLoopbackCapture());
 
     public void Start()

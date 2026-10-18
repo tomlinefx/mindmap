@@ -12,6 +12,7 @@
 - `Apps.cs`: `list`。既定の再生デバイスで音を出しているプロセスを、実行ファイル名を id にして出す
 - `Check.cs`: `check`。マイクの許可（Windows のプライバシー設定）と端末内 STT のモデルの有無
 - `Audio/Capture.cs`: 1 トラック分の取得。WASAPI の形式を 16 kHz モノラルの float にする
+- `Audio/ProcessLoopbackCapture.cs`: 相手の音。WASAPI の Process Loopback で、会議アプリのプロセス（とその子プロセス）が出す音だけを取る。NAudio に無いので `ActivateAudioInterfaceAsync` を自前で呼ぶ
 - `Transcription/ITranscriber.cs`: STT の差し口。`SherpaTranscriber.cs` が端末内 STT（sherpa-onnx の日本語 zipformer ＋ silero VAD。途中結果は区間のデコードし直し）。`FakeTranscriber.cs` は音の有無だけで「発言」を作る足場（`MINDMAP_STT=fake`）
 - `RunSession.cs`: `run`。2 トラックを取り、STT につなぎ、原点からの秒に直して送る
 - `SttFile.cs` / `CaptureFile.cs`: 開発用 `stt-file <wav>`（wav を STT に通して結果と RTF を出す）と `capture-wav self|other <秒> <out.wav>`（取得を wav に残す）
@@ -24,11 +25,12 @@ helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe list    # 音を�
 helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe check   # マイクの許可・STT のモデルの状態を JSON で出す
 helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe run --app Zoom.exe --port 8765 [--origin <hostTime>] [--self-manual pause|take]
 helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe stt-file <wav>   # 開発用。モデルの確認
+helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe capture-wav other 10 out.wav Zoom.exe   # 開発用。Process Loopback の確認（app id を省くと再生デバイス全体）
 ```
 
 端末内 STT のモデルは `scripts/win-stt-models.cmd` で `%LOCALAPPDATA%\mindmap\models\stt` に入れる（約 150 MB。`check` の `sttModel` が `installed` になる）。
 
-- `--app`: `list` の id（実行ファイル名）。動いていなくても始まる（いまは再生デバイス全体の音を取るため）
+- `--app`: `list` の id（実行ファイル名）。そのプロセスの音だけを Process Loopback で取る。PID は音を出しているプロセスを優先し、無ければ同じ名前で最初に始まったもの（子プロセスの音も一緒に取る）。動いていなければ知らせたうえで始め、再生デバイス全体の音を取る。セッションの途中で会議アプリを終了して起動し直すと PID が変わるので、相手の音は届かなくなる（`tap-silent` が出る。セッションの起動し直しで追い直す）
 - `--origin`: 起動し直しのとき、server が最初の起動の `origin` の値を渡す。無ければ自分で原点を決めて `origin` を送る
 - `--self-manual`: 起動し直しのとき、server が覚えていた手動の休止の状態
 - 環境変数 `LIVE_MINDMAP_HELPER_CONTROL_TOKEN`: server からの指示の合言葉。指示の JSON の `token` と比べる
@@ -54,6 +56,5 @@ server が止めるときは Windows なので SIGTERM は届かず、プロセ�
 
 ## 未実装（ADR 0001 の順）
 
-1. 相手の音を会議アプリのプロセスだけから取る（WASAPI Process Loopback）。いまは既定の再生デバイス全体の loopback
-2. エコーキャンセル（WebRTC AEC3 + high-pass filter）。スピーカーで聞いたときの相手の声の漏れを、自分のトラックから消す
-3. クラウド STT の実装（差し口だけある）
+1. エコーキャンセル（WebRTC AEC3 + high-pass filter）。スピーカーで聞いたときの相手の声の漏れを、自分のトラックから消す
+2. クラウド STT の実装（差し口だけある）
