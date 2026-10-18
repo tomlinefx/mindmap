@@ -50,7 +50,8 @@ const Session = Schema.Struct({
   keyList: Popover.Model,
 });
 
-// startsNarrow: 開いた時点で幅が狭かったか（startFlags.ts）。画面の部品はスナップショットが届いてから作るので、そのときに右の列と字幕を隠して始めるために覚えておく
+// startsNarrow: 開いた時点で幅が狭かったか（startFlags.ts）。画面の部品はスナップショットが届いてから作るので、そのときに右の列を隠して始めるために覚えておく。
+// 字幕は狭い幅でも出して始める（閲覧の共有の Android はキーボードが無く C で出せないため。ADR 0003）
 export const Model = Schema.Struct({ feed: LiveFeed.Model, isMac: Schema.Boolean, startsNarrow: Schema.Boolean, session: Schema.Option(Session) });
 export type Model = typeof Model.Type;
 type SessionModel = typeof Session.Type;
@@ -96,7 +97,7 @@ const received = (model: Model, feed: LiveFeed.Model): Return => {
   if (Option.isNone(withFeed.session)) {
     if (Option.isNone(feed.snapshot)) return { model: withFeed };
     const surface = startingSurface(MapSurface.init(feed.snapshot.value, "live", model.isMac), { startsNarrow: model.startsNarrow });
-    const layout = { ...SessionLayout.init(), captionsHidden: model.startsNarrow };
+    const layout = SessionLayout.init();
     const session: SessionModel = { mapSurface: stripSurface(surface), sessionLayout: stripLayout(layout), keyList: initKeyList() };
     const created = modifyFields(withFeed, { session: () => Option.some(session) });
     return Update.combine(created, [

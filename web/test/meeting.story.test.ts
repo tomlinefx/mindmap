@@ -123,11 +123,11 @@ describe("会議中の update: 狭い幅で開いたときの右の列と字幕"
   };
   const hidden = (m: Model) => ({ side: sessionOf(m).mapSurface.viewing.sideHidden === true, captions: sessionOf(m).sessionLayout.captionsHidden });
 
-  it("狭い幅で開くと、最初のスナップショットで右の列と字幕を隠して始め、E・C で出せる", () => {
+  it("狭い幅で開くと、最初のスナップショットで右の列だけを隠して始め（字幕はキーボードの無い端末でも読めるよう出したまま）、E で出し、C で字幕を隠せる", () => {
     const opened = run([frameMessage(FIRST), measured], init(false, { startsNarrow: true })).model;
     expect(Schema.is(MeetingModel)(opened)).toBe(true);
-    expect(hidden(opened)).toEqual({ side: true, captions: true });
-    expect(hidden(run([keyMessage("E"), keyMessage("C")], opened).model)).toEqual({ side: false, captions: false });
+    expect(hidden(opened)).toEqual({ side: true, captions: false });
+    expect(hidden(run([keyMessage("E"), keyMessage("C")], opened).model)).toEqual({ side: false, captions: true });
   });
 
   it("広い幅で開くと、今までどおり両方出して始める", () => {
@@ -137,9 +137,9 @@ describe("会議中の update: 狭い幅で開いたときの右の列と字幕"
   it("開いた後は、次のスナップショットでも画面の大きさが変わっても、隠す・出すは変わらない（人の操作を上書きしない）", () => {
     const resized = surfaceMessage(MapSurfaceMessage.MeasuredMapSurface({ width: 390, height: 844, nodeHeights: HEIGHTS }));
     const hiddenAtStart = run([frameMessage(FIRST), measured], init(false, { startsNarrow: true })).model;
-    expect(hidden(run([frameMessage(SECOND), resized], hiddenAtStart).model)).toEqual({ side: true, captions: true });
+    expect(hidden(run([frameMessage(SECOND), resized], hiddenAtStart).model)).toEqual({ side: true, captions: false });
     const shownByHand = run([keyMessage("E"), keyMessage("C")], hiddenAtStart).model;
-    expect(hidden(run([frameMessage(SECOND), resized], shownByHand).model)).toEqual({ side: false, captions: false });
+    expect(hidden(run([frameMessage(SECOND), resized], shownByHand).model)).toEqual({ side: false, captions: true });
     const shownAtStart = run([frameMessage(FIRST), measured], init(false, { startsNarrow: false })).model;
     expect(hidden(run([resized], shownAtStart).model)).toEqual({ side: false, captions: false });
   });
