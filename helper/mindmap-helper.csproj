@@ -7,6 +7,8 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <AssemblyName>mindmap-helper</AssemblyName>
+    <!-- 配布物（GitHub Releases の zip。scripts/win-release-helper.cmd）の版。helper の振る舞いが変わったら上げる -->
+    <Version>0.1.0</Version>
     <RootNamespace>Mindmap.Helper</RootNamespace>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

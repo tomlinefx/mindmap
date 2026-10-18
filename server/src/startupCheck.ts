@@ -2,7 +2,7 @@
 // ヘルパーの `check` の結果から項目にする。欠けると始められないものが足りなければ StartupDepsMissing で始めない（exit 3）。
 // 足りないものを入れるのは利用者が確かめてから明示で行い、確かめの中では入れない。
 import { Effect, Schema } from "effect";
-import { HELPER_BUILD_COMMAND } from "./helperPath.ts";
+import { HELPER_BUILD_COMMAND, INSTALLED_HELPER_DIR_NAME } from "./helperPath.ts";
 import type { HelperCheck, HelperCheckFailure } from "./helpers.ts";
 
 export const Item = Schema.Struct({
@@ -27,7 +27,7 @@ export class StartupDepsMissing extends Schema.TaggedError<StartupDepsMissing>()
     const names = new Set(this.items.map((item) => item.name));
     return [
       `開始しません。足りないもの: ${this.items.map(describeItem).join("、")}`,
-      ...(names.has("helper") ? [`ヘルパーを用意するには: ${HELPER_BUILD_COMMAND}`] : []),
+      ...(names.has("helper") ? [`ヘルパーを用意するには: ${HELPER_BUILD_COMMAND}（または GitHub Releases の mindmap-helper-win-x64 の zip を ${INSTALLED_HELPER_DIR_NAME} に展開）`] : []),
       ...(names.has("microphone") ? ["Windows の 設定 > プライバシーとセキュリティ > マイク で、デスクトップ アプリにマイクの使用を許可してください"] : []),
       ...(names.has("stt-model") ? ["音声認識のモデルを入れてください（helper/README.md）"] : []),
       "利用者に確認してから入れてください",

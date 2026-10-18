@@ -5,21 +5,26 @@
 ## 要るもの
 
 - Windows 10 2004 以降（会議アプリの音だけを取る WASAPI Process Loopback のため）
-- Node.js と pnpm、.NET 10 SDK
+- Node.js と pnpm
 - Claude の API キー（環境変数 `ANTHROPIC_API_KEY`。差分更新に使う。音声は PC の外に出ないが、発言の文字は Claude に送る）
 - 設定 > プライバシーとセキュリティ > マイク で、デスクトップ アプリにマイクの許可
-- エコーキャンセルの dll を作るときだけ、Visual Studio の「C++ によるデスクトップ開発」（無くても動く。下記）
+- ヘルパー（音の取得と音声認識）を自分でビルドするときだけ、.NET 10 SDK と、エコーキャンセルの dll を作るための Visual Studio「C++ によるデスクトップ開発」。ビルド済みを使えば要らない（下記）
 
 ## 初回の準備
 
 ```
+git clone https://github.com/tomlinefx/mindmap.git
+cd mindmap
 pnpm install
-scripts\win-helper-build.cmd          # ヘルパー（C#）を Release でビルドする
 scripts\win-stt-models.cmd            # 端末内 STT のモデル（約 150 MB）を %LOCALAPPDATA%\mindmap\models\stt に入れる
-scripts\win-webrtc-apm.cmd            # 任意: エコーキャンセル（WebRTC AEC3）の dll を作り、もう一度 win-helper-build.cmd
 ```
 
-そろったかは `cd server` して `node src/cli.ts check` で見る（マイクの許可と STT のモデルが ready なら始められる）。
+ヘルパーは次のどちらかで用意する。
+
+- **ビルド済みを使う**: [Releases](https://github.com/tomlinefx/mindmap/releases) の `mindmap-helper-win-x64-v*.zip` を取り、中身を `%LOCALAPPDATA%\mindmap\helper` に置く（`mindmap-helper.exe` がそのフォルダの直下に来るように）。.NET ランタイム同梱で、エコーキャンセルも入っている
+- **自分でビルドする**: `scripts\win-helper-build.cmd`（.NET 10 SDK が要る）。エコーキャンセルも要るなら `scripts\win-webrtc-apm.cmd` を先に（Visual Studio の C++ が要る。数分）
+
+そろったかは `cd server` して `node src/cli.ts check` で見る（マイクの許可と STT のモデルが ready なら始められる）。ヘルパーが見つからないときは、サーバーが探した場所と用意の仕方を標準エラーに出す。
 
 ## 会議のたびに
 

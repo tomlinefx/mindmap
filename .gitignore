@@ -10,6 +10,9 @@ dist/
 # WebRTC AEC3 のビルド結果と、そのビルドに使う uv（scripts/win-webrtc-apm.cmd が作る）
 helper/.deps/
 
+# ビルド済みの helper の配布物（scripts/win-release-helper.cmd が作る。GitHub Releases に上げる）
+helper/.release/
+
 # playwright-cli が録画・操作のたびに書く作業ファイル
 .playwright-cli/
 
