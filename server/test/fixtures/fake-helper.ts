@@ -1,5 +1,5 @@
-// 偽のヘルパー。実物（helper/）の `list` と `run --app <id> --port <n> [--audio-dir <dir>] [--audio-index <n>] [--origin <host time>]` の
-// 外から見える振る舞いだけを真似る。
+// 偽のヘルパー。実物（helper/）の `check`・`list` と `run --app <id> --port <n> [--origin <host time>] [--self-manual pause|take]` の
+// 外から見える振る舞いだけを真似る（--audio-dir / mix は上流の録音の名残で、この repo の実物は受けない）。
 //   node fake-helper.ts <台本JSON> <記録ファイル> list
 //   node fake-helper.ts <台本JSON> <記録ファイル> run --app <id> --port <n> ...
 //   node fake-helper.ts <台本JSON> <記録ファイル> mix --session <dir> --out <path> [--track 自分]
@@ -65,7 +65,8 @@ function closeAudioThen(audioDir: string | undefined, index: number | undefined,
 }
 
 if (command === "check") {
-  console.log(JSON.stringify({ microphone: "authorized", ...(rest.includes("--no-screen") ? {} : { screenCapture: true }), speechJa: { status: "installed", installedLocales: ["ja-JP"] } }));
+  // 実物（helper/Check.cs）と同じ形。server/src/helpers.ts の HelperCheckSchema が読む
+  console.log(JSON.stringify({ microphone: "authorized", sttModel: "installed" }));
 } else if (command === "list") {
   console.log(JSON.stringify(script.apps));
 } else if (command === "mix") {

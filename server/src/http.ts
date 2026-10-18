@@ -194,8 +194,21 @@ const ShareRoutes = HttpRouter.addAll([
   })),
 ]);
 
+// サーバー自身への終了の求め（/server/stop）の伝え先。main（server.ts）が、待っている Deferred を解く関数を渡す。
+// 既定は何もしない（テストが in-process で起こす startup。そこでは Scope を閉じて止める）
+export const ServerControl = Context.Reference("live-mindmap/ServerControl", {
+  defaultValue: () => ({ onStopRequested: (): void => {} }),
+});
+// 204 を返してから後片付けを始めるための猶予。求めは別のファイバーに切り離して伝える（待受けを閉じても応答を書き終えられる）
+const STOP_RESPONSE_GRACE_MS = 100;
+
 const ServerIdentityRoutes = HttpRouter.addAll([
   HttpRouter.route(ServerRoutes.server.method, ServerRoutes.server.path, Effect.suspend(() => jsonOf(ServerRoutes.server.response)({ pid: process.pid }))),
+  HttpRouter.route(ServerRoutes.serverStop.method, ServerRoutes.serverStop.path, Effect.gen(function* () {
+    const control = yield* ServerControl;
+    yield* Effect.forkDetach(Effect.sleep(STOP_RESPONSE_GRACE_MS).pipe(Effect.andThen(Effect.sync(control.onStopRequested))));
+    return HttpServerResponse.empty({ status: 204 });
+  })),
 ]);
 
 const FeedRoutes = HttpRouter.addAll([

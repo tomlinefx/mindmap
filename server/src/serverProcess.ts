@@ -1,7 +1,7 @@
 // 常駐サーバーの PID の記録と、cli server stop が止める相手を決める規則。
 // サーバーは待ち受けたポートごとに PID を書き、Scope を閉じる（きれいに終わる）ときに消す。
 // 記録は SIGKILL などで残ることがあり、その PID が別のプロセスに使い回されていることもある。だから記録だけを信じて
-// シグナルを送らない。送るのは、そのポートで応答したサーバー自身が名乗った PID だけにする（planServerStop）。
+// 止めない。止めるのは、そのポートで応答したサーバー自身（/server/stop で終了を求め、名乗った PID で終わるのを待つ）だけにする（planServerStop）。
 import { dirname, join, resolve } from "node:path";
 import { Context, Effect, FileSystem, Predicate, Schema } from "effect";
 
@@ -47,11 +47,11 @@ export const removeServerPid = Effect.fnUntraced(function* (sessionsDir: string,
 });
 
 export type ServerStopPlan =
-  // そのポートで応答したサーバーが名乗った PID。これだけにシグナルを送る
+  // そのポートで応答したサーバーが名乗った PID。そのサーバーに終了を求め、この PID が終わるのを待つ
   | { readonly action: "terminate"; readonly pid: number }
   // 応答が無く、記録も無いか、記録の PID のプロセスがもう無い（stale はその古い記録の PID）
   | { readonly action: "not-running"; readonly stale: number | undefined }
-  // 応答が無いのに、記録の PID のプロセスは生きている。固まったサーバーか、PID を使い回した別のプロセスか見分けられないので送らない
+  // 応答が無いのに、記録の PID のプロセスは生きている。固まったサーバーか、PID を使い回した別のプロセスか見分けられないので止めない
   | { readonly action: "unresponsive"; readonly pid: number };
 
 // reported: ポートで応答したサーバーが名乗った PID（応答が無ければ undefined）。recorded: 記録の PID。recordedAlive: その PID のプロセスがあるか
@@ -62,7 +62,7 @@ export const planServerStop = (input: { reported: number | undefined; recorded: 
   return { action: "unresponsive", pid: input.recorded };
 };
 
-// プロセスの有無の確認と SIGTERM。既定は本物の process.kill。テストは偽物を渡す
+// プロセスの有無の確認。既定は本物の process.kill（シグナル 0。Windows でも有無の確認には使える）。テストは偽物を渡す
 export const ServerProcess = Context.Reference("live-mindmap/ServerProcess", {
   defaultValue: () => ({
     // シグナル 0 は届くかだけを確かめる。EPERM は「あるが自分のものではない」なので、あるとみなす
@@ -72,14 +72,6 @@ export const ServerProcess = Context.Reference("live-mindmap/ServerProcess", {
         return true;
       } catch (error) {
         return Predicate.hasProperty(error, "code") && error.code === "EPERM";
-      }
-    }),
-    // もう終わっていた（ESRCH）なら何もしない
-    terminate: (pid: number): Effect.Effect<void> => Effect.sync(() => {
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch (error) {
-        if (!(Predicate.hasProperty(error, "code") && error.code === "ESRCH")) throw error;
       }
     }),
   }),

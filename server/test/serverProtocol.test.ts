@@ -35,7 +35,7 @@ describe("/session/start の本文の decode", () => {
 describe("経路の記述", () => {
   const routes = Object.values(ServerRoutes);
 
-  it("13 本の method と path が、今の server の経路と一致する", () => {
+  it("14 本の method と path が、今の server の経路と一致する", () => {
     expect(routes.map(({ method, path }) => `${method} ${path}`).sort()).toEqual(
       [
         "GET /apps",
@@ -49,6 +49,7 @@ describe("経路の記述", () => {
         "POST /share/close",
         "GET /share/status",
         "GET /server",
+        "POST /server/stop",
         "GET /check",
         "GET /ws",
       ].sort(),

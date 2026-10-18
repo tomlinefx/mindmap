@@ -681,7 +681,7 @@ describe("会議中（Foldkit 版）の寸法", () => {
 
 // Issue #969: 幅 768px 以下（スマホ・縦向きの iPad）の並べ方。CSS の @media で切り替え、会議中の画面（.meeting）だけに効く。
 // 狭い幅では右の列とキーの一覧を隠し、ノードを選んでいる間だけ根拠を画面下のシートとして出す。字幕は左右 12px の余白を除いた幅いっぱい、知らせは字幕の上に 1 行で重ねる。
-// 狭い幅で開くと字幕と右の列を隠して始める（Issue #1236 の一部）ので、字幕の並べ方を見るときは C で出してから測る。
+// 狭い幅で開くと右の列を隠して始める（Issue #1236 の一部）が、字幕は出して始める（閲覧の共有の Android はキーボードが無く C で出せない。ADR 0003）。
 // 769px 以上（Mac の幅）の並べ方は変えない
 const NARROW_VIEWPORTS = [
   { width: 390, height: 844 },
@@ -689,9 +689,8 @@ const NARROW_VIEWPORTS = [
 ] as const;
 const MARGIN = 12;
 
-// 狭い幅で開いた直後は字幕を隠している。C で出して、.captions が描かれるまで待つ
+// 字幕（.captions）が描かれるまで待つ
 const showCaptions = async (page: Page): Promise<void> => {
-  await page.keyboard.press("C");
   await page.locator(".captions").waitFor({ timeout: 10_000 });
 };
 
@@ -873,12 +872,14 @@ describe.each(NARROW_VIEWPORTS)("会議中（Foldkit 版）の狭い幅: $width�
 
 describe("会議中（Foldkit 版）の開いたときの字幕と右の列", () => {
   it(
-    "390×844 で開くと字幕を隠して始め、C で出せる（右の列は狭い幅の CSS が隠すので、隠して始めることは meeting.story.test.ts が見る）",
+    "390×844 で開いても字幕は出ていて、C で隠せる（右の列は狭い幅の CSS が隠すので、隠して始めることは meeting.story.test.ts が見る）",
     () => withBrowser(async (browser) => {
       const page = await openMeetingPage(browser, server, { frames: frames.first, viewport: NARROW_VIEWPORTS[0] });
       await settled(page);
-      expect(await page.locator(".captions").count()).toBe(0);
       await showCaptions(page);
+      expect(await page.locator(".captions").count()).toBe(1);
+      await page.keyboard.press("C");
+      await page.locator(".captions").waitFor({ state: "detached", timeout: 10_000 });
       await page.context().close();
     }),
     MEETING_TIMEOUT,

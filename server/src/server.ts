@@ -5,7 +5,7 @@
 // このモジュールが持つのは、それらの Layer を組み立てて待受けにつなぐ、起動・終了の入口。
 // ブラウザへの WebSocket は HTTP と同じポートで待ち受ける。同時に扱うセッションは 1 つ。
 import { NodeChildProcessSpawner, NodeFileSystem, NodePath, NodeRuntime } from "@effect/platform-node";
-import { Cause, ConfigProvider, Effect, Exit, type FileSystem, Layer, Logger, Runtime } from "effect";
+import { Cause, ConfigProvider, Deferred, Effect, Exit, type FileSystem, Layer, Logger, Runtime } from "effect";
 import { HttpServer } from "effect/http";
 import { portConfig, sessionsDirConfig, viewPortConfig } from "./config.ts";
 import { prepareUpdaterLayer } from "./diffUpdater.ts";
@@ -13,7 +13,7 @@ import { exitNaturally } from "./exitNaturally.ts";
 import { resolveHelperPath } from "./helperPath.ts";
 import { Helpers, type HelperCommand } from "./helpers.ts";
 import { ReviewBuild } from "./review.ts";
-import { layerListener, openViewingPort, portOf, serveSessions } from "./http.ts";
+import { layerListener, openViewingPort, portOf, ServerControl, serveSessions } from "./http.ts";
 import { Sessions, SessionsDir } from "./sessions.ts";
 import { SessionSinks, type SessionSinksDeps } from "./sessionSinks.ts";
 import { Viewers } from "./viewers.ts";
@@ -25,6 +25,8 @@ export type ListenOptions = {
   viewPort: number; // 閲覧の口（ADR 0003）のポート。0 なら空きポート
   sessionsDir: string;
   onListening?: (port: number) => void;
+  // cli server stop（POST /server/stop）が終了を求めたときに呼ばれる（204 を返した後）。渡さなければ何も起きない
+  onStopRequested?: () => void;
 };
 
 export type ServerOptions = ListenOptions & {
@@ -56,7 +58,7 @@ export const realLayers = (options: ServerOptions, exportServices: ExportService
 // （進行中のセッションのヘルパー・updater の後始末）→ 待受けを閉じる
 export const startup = Effect.fnUntraced(function* (options: ListenOptions, layers: ServerLayers) {
   // 待受け・Viewers・Sessions を 1 つの Layer に組む（依存を先に build するので、止めるときは Sessions が待受けより先）
-  const context = yield* Layer.build(
+  const context = yield* Layer.build(Layer.mergeAll(
     Sessions.layer.pipe(
       Layer.provide(Layer.mergeAll(layers.sessionSinks, Layer.succeed(SessionsDir)(options.sessionsDir))),
       Layer.provideMerge(layers.helpers),
@@ -64,7 +66,9 @@ export const startup = Effect.fnUntraced(function* (options: ListenOptions, laye
       // 閲覧の共有は、Sessions（セッションの Scope）・Viewers の上に載せる。止めるときは Sessions より先
       (base) => ViewingShare.layer({ openViewingPort: (pin) => openViewingPort(options.viewPort, pin), addresses: lanAddresses }).pipe(Layer.provide(layers.viewing), Layer.provideMerge(base)),
     ),
-  );
+    // /server/stop の終了の求めの伝え先（http.ts）
+    Layer.succeed(ServerControl)({ onStopRequested: options.onStopRequested ?? (() => {}) }),
+  ));
   return yield* Effect.gen(function* () {
     yield* serveSessions;
     // 配信の停止・Sessions・待受けを閉じるより先に、最後のフレームを接続中のクライアントへ渡し切る
@@ -98,7 +102,8 @@ if (import.meta.main) {
     // 終了時の書き出しの Service は、ここで 1 回だけ組む（書き出しのたびに Layer を作り直さない）
     const exportServices = ReviewBuild.layer.pipe(Layer.provideMerge(NodeFileSystem.layer));
     // runMain は SIGINT・SIGTERM でルートのファイバーを中断する。中断で Scope が閉じ、ヘルパー・配信・
-    // 待受けが後片付けされる（process.exit で finalizer を迂回しない）。runMain はこの入口にだけ置く
+    // 待受けが後片付けされる（process.exit で finalizer を迂回しない）。runMain はこの入口にだけ置く。
+    // cli server stop（/server/stop）からの終了の求めは、Windows にシグナルが無いので Deferred で受け、同じ Scope の閉じ方で終わる（終了コード 0）
     // 設定（ポートとフォルダ）の解決に失敗したときだけ、理由を標準エラーに出す。Effect の既定のロガーは標準出力に書くので、
     // ここだけ LogToStderr を立てる。待受けの失敗などほかの失敗は、runMain の自動報告（既定のロガー）のまま変えない。
     // 出した失敗には errorReported=false を付け、runMain が同じ失敗を標準出力へもう一度報告しないようにする
@@ -111,6 +116,7 @@ if (import.meta.main) {
     );
     NodeRuntime.runMain(Effect.scoped(Effect.gen(function* () {
       const { port, viewPort, sessionsDir } = yield* settings;
+      const stopRequested = yield* Deferred.make<void>();
       const options: ServerOptions = {
         port,
         viewPort,
@@ -118,9 +124,10 @@ if (import.meta.main) {
         prepareUpdater: prepareUpdaterLayer,
         helper: helperCommand,
         onListening: (port) => console.error(`live-mindmap サーバーを起動しました: http://127.0.0.1:${port}`),
+        onStopRequested: () => Effect.runFork(Deferred.succeed(stopRequested, undefined)),
       };
       yield* startup(options, realLayers(options, exportServices));
-      return yield* Effect.never;
+      yield* Deferred.await(stopRequested);
     })), { teardown });
   }
 }

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { NodeHttpClient, NodeServices } from "@effect/platform-node";
 import { describe, expect, it } from "@effect/vitest";
-import { Cause, ConfigProvider, Console, Effect, Exit, Layer } from "effect";
+import { Cause, ConfigProvider, Console, Deferred, Effect, Exit, Layer } from "effect";
 import { runCli } from "../src/cli.ts";
 import { Helpers } from "../src/helpers.ts";
 import { serverPidPath, ServerProcess } from "../src/serverProcess.ts";
@@ -88,25 +88,28 @@ describe("サーバーの PID の記録", () => {
 });
 
 describe("cli server stop", () => {
-  it.live("応答したサーバーが名乗った PID に SIGTERM を送り、終わるのを待って止めたことを出す", () => Effect.gen(function* () {
+  // 同じプロセスで起こしたサーバーなので、/server/stop の求め（onStopRequested）を受けたら Scope を閉じて、名乗った PID（自分）が終わったことにする
+  it.live("応答したサーバーに /server/stop で終了を求め、名乗った PID が終わるのを待って止めたことを出す", () => Effect.gen(function* () {
     const sessionsDir = join(yield* directory, "sessions");
-    const server = yield* startedServer({ port: 0, viewPort: 0, sessionsDir }, serverLayers);
-    const signalled: number[] = [];
+    const stopRequested = yield* Deferred.make<void>();
+    const server = yield* startedServer({ port: 0, viewPort: 0, sessionsDir, onStopRequested: () => Effect.runFork(Deferred.succeed(stopRequested, undefined)) }, serverLayers);
     let alive = true;
+    yield* Effect.forkScoped(Deferred.await(stopRequested).pipe(Effect.andThen(server.close), Effect.andThen(Effect.sync(() => { alive = false; }))));
     const result = yield* serverStop(sessionsDir, server.port).pipe(Effect.provideService(ServerProcess, {
       alive: () => Effect.sync(() => alive),
-      terminate: (pid) => Effect.sync(() => { signalled.push(pid); }).pipe(Effect.andThen(server.close), Effect.andThen(Effect.sync(() => { alive = false; }))),
     }));
     expect(result.failed).toBe(false);
-    expect(signalled).toEqual([process.pid]);
+    expect(yield* Deferred.isDone(stopRequested)).toBe(true);
     expect(result.out).toBe(`サーバーを止めました（ポート ${server.port}、pid ${process.pid}）\n`);
     expect(existsSync(serverPidPath(sessionsDir, server.port))).toBe(false);
   }).pipe(Effect.scoped));
 
-  it.live("セッションが進行中なら断り、シグナルを送らない", () => Effect.gen(function* () {
+  it.live("セッションが進行中なら断り、終了を求めない", () => Effect.gen(function* () {
     const sessionsDir = join(yield* directory, "sessions");
+    const stopRequests: string[] = [];
     const server = yield* Effect.acquireRelease(Effect.tryPromise(() => new Promise<Server>((resolve, reject) => {
       const server = createServer((request, response) => {
+        if (request.url === "/server/stop") stopRequests.push(request.method ?? "");
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify(request.url === "/server" ? { pid: 424242 } : { status: "running", dir: "/tmp/x" }));
       });
@@ -115,18 +118,16 @@ describe("cli server stop", () => {
     })), (server) => Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve()))));
     const address = server.address();
     if (address === null || typeof address === "string") throw new Error("TCP の待受けがありません");
-    const signalled: number[] = [];
     const result = yield* serverStop(sessionsDir, address.port).pipe(Effect.provideService(ServerProcess, {
       alive: () => Effect.succeed(true),
-      terminate: (pid) => Effect.sync(() => { signalled.push(pid); }),
     }));
     expect(result.failed).toBe(true);
     expect(result.message).toContain("セッションが進行中です。先に cli stop で書き出してから");
-    expect(signalled).toEqual([]);
+    expect(stopRequests).toEqual([]);
   }).pipe(Effect.scoped));
 
-  // 2026-10-13 に pkill で関係の無いプロセスまで止めた。記録の PID が別のプロセスに使い回されていても、応答の無いポートの記録だけでは送らない
-  it.live("応答が無く、記録の PID のプロセスが生きているなら、本物の ServerProcess でもシグナルを送らずに断り、記録を残す", () => Effect.gen(function* () {
+  // 2026-10-13 に pkill で関係の無いプロセスまで止めた。記録の PID が別のプロセスに使い回されていても、応答の無いポートの記録だけでは止めない
+  it.live("応答が無く、記録の PID のプロセスが生きているなら、本物の ServerProcess でも止めずに断り、記録を残す", () => Effect.gen(function* () {
     const sessionsDir = join(yield* directory, "sessions");
     const port = yield* unusedPort;
     const child = yield* bystander;
@@ -148,7 +149,6 @@ describe("cli server stop", () => {
     const path = yield* writePid(sessionsDir, port, 424242);
     const result = yield* serverStop(sessionsDir, port).pipe(Effect.provideService(ServerProcess, {
       alive: () => Effect.succeed(false),
-      terminate: () => Effect.die("シグナルは送らない"),
     }));
     expect(result.failed).toBe(false);
     expect(result.out).toBe(`ポート ${port} のサーバーは動いていません\n`);

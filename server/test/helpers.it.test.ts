@@ -27,9 +27,8 @@ describe("E2E と IT 用の fake-helper", () => {
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout.trim().split("\n")).toHaveLength(1);
-    expect(JSON.parse(result.stdout)).toMatchObject({ microphone: "authorized", screenCapture: true,
-      speechJa: { status: expect.stringMatching(/^(unsupported|supported|downloading|installed)$/), installedLocales: expect.any(Array) },
-    });
+    // 実物（helper/Check.cs）と同じ形（HelperCheckSchema）
+    expect(JSON.parse(result.stdout)).toEqual({ microphone: "authorized", sttModel: "installed" });
   }).pipe(Effect.scoped));
 });
 

@@ -2,21 +2,19 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer } from "node:net";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect } from "effect";
 
 const cli = join(import.meta.dirname, "../src/cli.ts");
-// HOME を差し替える前に解決し、子プロセスも親と同じ管理の依存を読むようにする
-const depsDir = process.env.LIVE_MINDMAP_DEPS ?? join(homedir(), ".live-mindmap", "deps");
 
 function runProcess(argv: string[], sessionsDir: string, env: Record<string, string> = {}) {
   return Effect.tryPromise(() => new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
     execFile(process.execPath, [cli, ...argv], {
       encoding: "utf8",
       timeout: 10_000,
-      env: { ...process.env, HOME: join(sessionsDir, "home"), LIVE_MINDMAP_DEPS: depsDir, LIVE_MINDMAP_CONFIG: join(sessionsDir, "absent.config.json"), LIVE_MINDMAP_JUDGE: "off", LIVE_MINDMAP_MODEL: "", LIVE_MINDMAP_SESSIONS: sessionsDir, LIVE_MINDMAP_PORT: "0", NO_COLOR: "1", ...env },
+      env: { ...process.env, HOME: join(sessionsDir, "home"), LIVE_MINDMAP_CONFIG: join(sessionsDir, "absent.config.json"), LIVE_MINDMAP_JUDGE: "off", LIVE_MINDMAP_MODEL: "", LIVE_MINDMAP_SESSIONS: sessionsDir, LIVE_MINDMAP_PORT: "0", NO_COLOR: "1", ...env },
     }, (error, stdout, stderr) => {
       if (error) {
         if (error.killed || typeof error.code !== "number") {
@@ -71,10 +69,12 @@ describe("CLI のプロセス入口", () => {
     for (const flag of ["help", "version", "wizard", "completions", "log-level"]) {
       expect(result.stdout).toContain(`--${flag}`);
     }
-    expect(result.stdout).toContain("exit code 3 = 開始に要るものが未導入");
+    // exit code 3 の意味（開始に要るもの ＝ ヘルパー・マイクの許可・音声認識のモデル が足りない。ADR 0002）
+    expect(result.stdout).toContain("exit code 3 = 開始に要るもの（ヘルパー・マイクの許可・音声認識のモデル）が足りない");
   }).pipe(Effect.scoped));
 
-  it.live.each(["play", "apps", "start", "stop", "status", "resume", "export", "restore", "review", "eval", "install", "check"])(
+  // install は無い（ADR 0002: 依存は pnpm install で入り、足りないものを入れるのは利用者）
+  it.live.each(["play", "apps", "start", "stop", "status", "resume", "share", "export", "restore", "review", "eval", "check", "server"])(
     "%s --help は処理本体を実行せず成功する",
     (command) => Effect.gen(function* () {
       const sessionsDir = yield* temporaryDirectory;
@@ -84,20 +84,8 @@ describe("CLI のプロセス入口", () => {
       expect(result.stderr).toBe("");
       expect(result.stdout).toMatch(/Usage/i);
       expect(result.stdout).toContain(command);
-      if (["start", "resume", "play", "install", "check"].includes(command)) {
-        expect(result.stdout).toContain("入れる前に利用者に確認する");
-      }
     }).pipe(Effect.scoped),
   );
-
-  it.live("start --help は --no-screen とその説明（共有画面を AI に渡さない（取り込まない））を表示する", () => Effect.gen(function* () {
-    const sessionsDir = yield* temporaryDirectory;
-    const result = yield* runProcess(["start", "--help"], sessionsDir);
-
-    expect(result.code).toBe(0);
-    expect(result.stdout).toContain("--no-screen");
-    expect(result.stdout).toContain("共有画面を AI に渡さない（取り込まない）");
-  }).pipe(Effect.scoped));
 
   it.live("--version は成功して標準出力にバージョンを表示する", () => Effect.gen(function* () {
     const sessionsDir = yield* temporaryDirectory;
@@ -329,33 +317,14 @@ describe("CLI のプロセス入口", () => {
     expect(existsSync(sessionsDir)).toBe(false);
   }).pipe(Effect.scoped));
 
-  it.live("play --help は、文字起こしのほかにセッションのフォルダ（log.jsonl を持つフォルダ）も受けられることと、--screen と一緒に使えないことを説明する", () => Effect.gen(function* () {
+  // 共有画面（--screen）は無い（ADR 0002）ので、説明するのはセッションのフォルダを受けられることだけ
+  it.live("play --help は、文字起こしのほかにセッションのフォルダ（log.jsonl を持つフォルダ）も受けられることを説明する", () => Effect.gen(function* () {
     const sessionsDir = yield* temporaryDirectory;
     const result = yield* runProcess(["play", "--help"], sessionsDir);
 
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("セッションのフォルダ");
     expect(result.stdout).toContain("log.jsonl");
-    expect(result.stdout).toContain("一緒に使えない");
-  }).pipe(Effect.scoped));
-
-  it.live("play にセッションのフォルダと --screen を一緒に渡すと、理由の標準エラー 1 行と 0 以外の終了で、セッションのフォルダを作らない", () => Effect.gen(function* () {
-    const dir = yield* temporaryDirectory;
-    const folder = join(dir, "original");
-    const tsv = join(dir, "slides.tsv");
-    const sessionsDir = join(dir, "sessions");
-    yield* Effect.tryPromise(async () => {
-      await mkdir(folder);
-      await writeFile(join(folder, "log.jsonl"), '{"type":"start","title":"定例"}\n');
-      await writeFile(tsv, "start\tend\tslide\timage\n");
-    });
-    const result = yield* runProcess(["play", folder, "--screen", tsv], sessionsDir);
-
-    expect(result.code).not.toBe(0);
-    expect(result.stdout).toBe("");
-    expect(result.stderr.trimEnd().split("\n")).toHaveLength(1);
-    expect(result.stderr).toContain("--screen");
-    expect(existsSync(sessionsDir)).toBe(false);
   }).pipe(Effect.scoped));
 
   it.live("play は待ち受けるポートが使用中なら、ポート番号と LIVE_MINDMAP_PORT を含む標準エラー 1 行と 0 以外の終了で、セッションのフォルダを作らない", () => Effect.gen(function* () {

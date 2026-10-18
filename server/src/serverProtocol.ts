@@ -33,7 +33,7 @@ export const SpeakerNameBody = Schema.Struct({ label: Schema.String, name: Schem
 
 const StartedSession = Schema.Struct({ dir: Schema.String });
 const StoppedSession = Schema.Struct({ paths: Schema.Array(Schema.String) });
-// 待ち受けているサーバー自身の PID。cli server stop は、記録の PID ではなくこれにだけシグナルを送る（serverProcess.ts）
+// 待ち受けているサーバー自身の PID。cli server stop は、記録の PID ではなくこれで終わるのを待つ（serverProcess.ts）
 const ServerIdentity = Schema.Struct({ pid: Schema.Int.check(Schema.isGreaterThan(0)) });
 
 export type ServerRoute = {
@@ -56,6 +56,8 @@ export const ServerRoutes = {
   shareClose: { method: "POST", path: "/share/close", response: ShareStatus }, // 閉じる（開いていなくても成功する）
   shareStatus: { method: "GET", path: "/share/status", response: ShareStatus },
   server: { method: "GET", path: "/server", response: ServerIdentity },
+  // サーバー自身に終了を求める（204 を返した後に後片付けして終わる）。Windows にはシグナルが無いので、cli server stop はこれで止める
+  serverStop: { method: "POST", path: "/server/stop", response: Schema.Void },
   check: { method: "GET", path: "/check", response: CheckReport }, // 開始前の確かめ（ヘルパーの check）
   feed: { method: "GET", path: "/ws", response: Schema.Void }, // ブラウザへの配信（WebSocket の upgrade）
 } as const satisfies Record<string, ServerRoute>;

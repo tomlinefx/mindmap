@@ -13,7 +13,7 @@ import { startedServer } from "./fixtures/startedServer.ts";
 import { updaterLayer } from "./fixtures/sessionLayers.ts";
 import { connect } from "./fixtures/wsClient.ts";
 
-const apps = [{ bundleID: "us.zoom.xos", name: "zoom.us" }];
+const apps = [{ id: "Zoom.exe", name: "Zoom", pid: 1234, active: true }];
 const fakeHelper = join(import.meta.dirname, "fixtures/fake-helper.ts");
 const resource = Effect.fnUntraced(function* (options: { updaterLayer?: () => Layer.Layer<DiffUpdater> } & Pick<ExportServicesOptions, "build"> = {}) {
   const dir = yield* Effect.acquireRelease(
@@ -66,7 +66,7 @@ describe("HTTP 本文の検証（要件8・12）", () => {
     { name: "app欠落", body: {} },
     { name: "app空文字列", body: { app: "" } },
     { name: "appが数値", body: { app: 1 } },
-    { name: "titleが真偽値", body: { app: "us.zoom.xos", title: false } },
+    { name: "titleが真偽値", body: { app: "Zoom.exe", title: false } },
     { name: "本文がnull", body: null },
     { name: "本文が配列", body: [] },
   ];
@@ -82,7 +82,7 @@ describe("HTTP 本文の検証（要件8・12）", () => {
           if (e.code === "ENOENT") return [];
           throw e;
         }))).toEqual([]);
-        const valid = yield* Effect.tryPromise(() => r.request("POST", "/session/start", JSON.stringify({ app: "us.zoom.xos" }), undefined));
+        const valid = yield* Effect.tryPromise(() => r.request("POST", "/session/start", JSON.stringify({ app: "Zoom.exe" }), undefined));
         expect(valid.status).toBe(200);
         expect(yield* Effect.tryPromise(() => valid.json())).toEqual({ dir: expect.any(String) });
       }));
@@ -95,7 +95,7 @@ describe("HTTP 本文の検証（要件8・12）", () => {
       expect(response.status).toBe(400);
       expect(yield* Effect.tryPromise(() => response.json())).toEqual({ error: expect.any(String) });
       expect(yield* Effect.tryPromise(r.records)).toEqual([]);
-      expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"us.zoom.xos"}', undefined))).status).toBe(200);
+      expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"Zoom.exe"}', undefined))).status).toBe(200);
     }));
 
 });
@@ -113,7 +113,7 @@ describe("HTTP の失敗応答（要件8〜11）", () => {
   it.live("進行中のstartと動作中のresumeは409と各条件の文面を返す", () =>
     Effect.gen(function* () {
       const r = yield* resource();
-      const body = '{"app":"us.zoom.xos"}';
+      const body = '{"app":"Zoom.exe"}';
       expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", body, undefined))).status).toBe(200);
       const busy = yield* Effect.tryPromise(() => r.request("POST", "/session/start", body, undefined));
       expect(busy.status).toBe(409);
@@ -133,7 +133,7 @@ describe("HTTP の失敗応答（要件8〜11）", () => {
     it.live(`予期しない失敗の文面を伏せず500のerror JSONで返す: ${String(failure)}`, () =>
       Effect.gen(function* () {
         const r = yield* resource({ updaterLayer: () => Layer.effect(DiffUpdater, Effect.die(failure)) });
-        const response = yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"us.zoom.xos"}', undefined));
+        const response = yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"Zoom.exe"}', undefined));
         expect(response.status).toBe(500);
         expect(yield* Effect.tryPromise(() => response.json())).toEqual({ error: failure instanceof Error ? failure.message : failure });
       }));
@@ -150,7 +150,7 @@ describe("HTTP と両upgradeの共通Origin制限（要件2・13・24）", () =>
         const response = yield* Effect.tryPromise(() => r.request("GET", "/apps", undefined, origin));
         expect(response.status).toBe(200);
         expect(yield* Effect.tryPromise(() => response.json())).toEqual(apps);
-        expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"us.zoom.xos","title":"週次"}', origin))).status).toBe(200);
+        expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"Zoom.exe","title":"週次"}', origin))).status).toBe(200);
         const clients = [yield* connect(r.server.port, "/", origin), yield* connect(r.server.port, "/ws", origin)];
         // マップのほかに、差分更新の状態（type: "diff-update"）も接続時に届く。ここで確かめるのはマップだけ
         const map = { nodes: [{ id: "root", parent: null, kind: "会議", text: "週次", evidence: [] }], round: 0, changes: [], remarks: [] };
@@ -167,7 +167,7 @@ describe("HTTP と両upgradeの共通Origin制限（要件2・13・24）", () =>
       it.live(`Origin ${origin} はHTTPと${path}のupgradeで403になり、配信されない`, () =>
         Effect.gen(function* () {
           const r = yield* resource();
-          expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"us.zoom.xos"}', undefined))).status).toBe(200);
+          expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"Zoom.exe"}', undefined))).status).toBe(200);
           const withoutOrigin = yield* connect(r.server.port, path, undefined);
           yield* Effect.tryPromise(() => vi.waitFor(() => expect(withoutOrigin.frames).toContainEqual(expect.objectContaining({ round: 0 })), { timeout: 10_000 }));
           const response = yield* Effect.tryPromise(() => r.request("GET", "/apps", undefined, origin));
@@ -235,10 +235,10 @@ describe("セッションの開始・終了の処理中の保護（要件8・tes
           return FAKE_TEMPLATE;
         }),
       });
-      expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"us.zoom.xos"}', undefined))).status).toBe(200);
+      expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"Zoom.exe"}', undefined))).status).toBe(200);
       const stopping = r.request("POST", "/session/stop", undefined, undefined); // await しない。処理中に start を送る
       yield* Effect.tryPromise(() => reachedCapture);
-      const response = yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"us.zoom.xos"}', undefined));
+      const response = yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"Zoom.exe"}', undefined));
       expect(response.status).toBe(409);
       expect(yield* Effect.tryPromise(() => response.json())).toEqual({ error: "セッションの開始・終了の処理中です" });
       releaseCapture!();

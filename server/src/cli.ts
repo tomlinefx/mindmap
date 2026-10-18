@@ -595,7 +595,7 @@ const checkCommand = Command.make(
   "開始せず、開始前の確かめ（ヘルパー・マイクの許可・音声認識のモデル）を JSON で出す。足りないものがあれば exit code 3。常駐サーバー（pnpm dev）に頼む",
 ));
 
-// サーバーが SIGTERM の後に終わるのを待つ上限と、確かめる間隔
+// サーバーに終了を求めた後、終わるのを待つ上限と、確かめる間隔
 const SERVER_EXIT_TIMEOUT_MS = 15_000;
 const SERVER_EXIT_POLL_MS = 100;
 
@@ -631,7 +631,8 @@ const serverStop = Command.make(
         // 止めるとセッションは書き出されずに終わるので、進行中なら断る
         const { status } = yield* requestServer(port, ServerRoutes.sessionStatus);
         if (status !== "none") return yield* new CommandFailed({ message: "セッションが進行中です。先に cli stop で書き出してから、もう一度 server stop を打ってください" });
-        yield* processes.terminate(plan.pid);
+        // シグナルではなく HTTP で終了を求める（Windows にはシグナルが無い）。サーバーは 204 を返してから後片付けして終わる
+        yield* executeServerRequest(port, ServerRoutes.serverStop);
         const exited = yield* processes.alive(plan.pid).pipe(
           Effect.repeat({ until: (alive) => !alive, schedule: Schedule.spaced(SERVER_EXIT_POLL_MS) }),
           Effect.timeoutOption(SERVER_EXIT_TIMEOUT_MS),
@@ -642,7 +643,7 @@ const serverStop = Command.make(
     }
   }),
 ).pipe(Command.withDescription(
-  "常駐サーバー（pnpm dev）を止める。LIVE_MINDMAP_PORT のポートで応答したサーバー自身の PID にだけ終了を求め、終わるまで待つ。"
+  "常駐サーバー（pnpm dev）を止める。LIVE_MINDMAP_PORT のポートで応答したサーバー自身に終了を求め（/server/stop）、名乗った PID が終わるまで待つ。"
     + "セッションが進行中なら断る（先に stop）。動いていなければ何もしない。taskkill などで止めない",
 ));
 

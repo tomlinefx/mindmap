@@ -60,9 +60,13 @@ const processResource = Effect.fnUntraced(function* (
   return { child, exited, started, output, sessionsDir };
 });
 
+// Windows にはシグナルが無く、child.kill("SIGINT") は TerminateProcess（後片付け無しの強制終了）になるので、シグナルでの終了の契約は確かめられない。
+// Windows の止め方は cli server stop（/server/stop）で、その契約は下で確かめる
+const itPosix = process.platform === "win32" ? it.live.skip : it.live;
+
 describe("server main の終了（要件6・7）", () => {
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
-    it.live(`${signal}で同じプロセスの接続とlistenerを解放して終了する`, () =>
+    itPosix(`${signal}で同じプロセスの接続とlistenerを解放して終了する`, () =>
       Effect.gen(function* () {
         const p = yield* processResource(0);
         const started = yield* Effect.tryPromise(() => p.started);
@@ -88,7 +92,7 @@ describe("server main の終了（要件6・7）", () => {
       }), TIMEOUT);
   }
 
-  // 実物の CLI の server stop が、起動した本物のサーバーを PID の記録と自己申告の PID で止める（pkill を使わない止め方）
+  // 実物の CLI の server stop が、起動した本物のサーバーに /server/stop で終了を求め、自己申告の PID で終わるのを待つ（シグナルも pkill も使わない止め方）
   it.live("cli server stop で止まり、終了コード 0 で終わり、PID の記録を消す", () =>
     Effect.gen(function* () {
       const p = yield* processResource(0);

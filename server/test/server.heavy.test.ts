@@ -22,7 +22,7 @@ import { updaterLayer } from "./fixtures/sessionLayers.ts";
 // 実物の子プロセス・実物の HTTP・実物の WebSocket を通さないと確かめられない契約だけ。
 
 const fakeHelper = join(import.meta.dirname, "fixtures/fake-helper.ts");
-const APPS = [{ bundleID: "us.zoom.xos", name: "zoom.us" }];
+const APPS = [{ id: "Zoom.exe", name: "Zoom", pid: 1234, active: true }];
 const remark = (track: "自分" | "相手", start: number, end: number, text: string) => ({ type: "remark", track, start, end, text, duplicate: false });
 
 type Script = {
@@ -133,6 +133,8 @@ const logEvents = (dir: string) =>
   Effect.promise(async () => (await readFile(join(dir, "log.jsonl"), "utf8")).split("\n").filter((l) => l !== "").map((l) => JSON.parse(l)));
 
 const waitFor = (fn: () => void, options?: { timeout: number }) => Effect.promise(() => vi.waitFor(fn, options));
+// シグナルの振る舞いそのものを確かめる契約は Windows に無い（シグナルが無く、kill は強制終了）
+const itPosix = process.platform === "win32" ? it.live.skip : it.live;
 
 describe("Helpers の実物 Layer の契約（本物の子プロセス・HTTP・WebSocket。CT-TEST-SPLIT）", () => {
   it.live("疎通: cli apps → start → 発言 → stop → export（HTTP・/ws・子プロセスを本物で）", () =>
@@ -142,11 +144,11 @@ describe("Helpers の実物 Layer の契約（本物の子プロセス・HTTP・
       expect(JSON.parse(yield* cli("apps"))).toEqual(APPS);
 
       const before = yield* connect(server.port);
-      yield* cli("start", "--app", "us.zoom.xos", "--title", "週次");
+      yield* cli("start", "--app", "Zoom.exe", "--title", "週次");
       yield* waitFor(() => expect(records().filter((r) => r.type === "connection")).toHaveLength(1));
       const runs = records().filter((r) => r.type === "run");
       expect(runs).toHaveLength(1);
-      expect(runs[0]!.argv.slice(0, 3)).toEqual(["run", "--app", "us.zoom.xos"]);
+      expect(runs[0]!.argv.slice(0, 3)).toEqual(["run", "--app", "Zoom.exe"]);
       yield* waitFor(() => expect(calls.flatMap((c) => c.fresh)).toHaveLength(1));
 
       const stdout = yield* cli("stop");
@@ -160,13 +162,14 @@ describe("Helpers の実物 Layer の契約（本物の子プロセス・HTTP・
     }));
 
   // 実時間で HELPER_STOP_TIMEOUT_MS（5 秒）待つ唯一の本物の時間のテスト（order.md:47, 65。forceKillAfter は
-  // Node のタイマーで測るので TestClock では進まない）。stop・close の両方の経路を 1 本にまとめる（order.md:42）
-  it.live(
+  // Node のタイマーで測るので TestClock では進まない）。stop・close の両方の経路を 1 本にまとめる（order.md:42）。
+  // Windows では SIGTERM が TerminateProcess（即座の強制終了）になり、無視も SIGKILL への切り替えも起きないので確かめられない
+  itPosix(
     "SIGTERM を無視するヘルパーを、stop でも close でも 5 秒後に SIGKILL で止める",
     () =>
       Effect.gen(function* () {
         const { cli, calls, records, stderr } = yield* setup({ ignoreSigterm: true });
-        yield* cli("start", "--app", "us.zoom.xos", "--title", "週次");
+        yield* cli("start", "--app", "Zoom.exe", "--title", "週次");
         yield* waitFor(() => expect(calls.flatMap((c) => c.fresh)).toHaveLength(1));
         const run = records().find((r) => r.type === "run");
         if (run?.type !== "run") throw new Error("ヘルパーが起動していない");
@@ -180,7 +183,7 @@ describe("Helpers の実物 Layer の契約（本物の子プロセス・HTTP・
 
         // close の経路も同じ時間内に戻り、子プロセスを残さない
         const { server: server2, cli: cli2, records: records2 } = yield* setup({ ignoreSigterm: true });
-        yield* cli2("start", "--app", "us.zoom.xos");
+        yield* cli2("start", "--app", "Zoom.exe");
         yield* waitFor(() => expect(records2().filter((r) => r.type === "connection")).toHaveLength(1));
         const run2 = records2().find((r) => r.type === "run");
         if (run2?.type !== "run") throw new Error("ヘルパーが起動していない");
@@ -197,7 +200,7 @@ describe("Helpers の実物 Layer の契約（本物の子プロセス・HTTP・
   it.live("サーバーが終わるとき、起動していたヘルパーの子プロセスを（プロセスグループごと）残さない", () =>
     Effect.gen(function* () {
       const { server, cli, records } = yield* setup();
-      yield* cli("start", "--app", "us.zoom.xos");
+      yield* cli("start", "--app", "Zoom.exe");
       const run = records().find((r) => r.type === "run");
       if (run?.type !== "run") throw new Error("ヘルパーが起動していない");
       expect(() => process.kill(run.pid, 0)).not.toThrow(); // 生きている
@@ -214,7 +217,7 @@ describe("Helpers の実物 Layer の契約（本物の子プロセス・HTTP・
     Effect.gen(function* () {
       const { cliFailure } = yield* setup({ failRun: { stderr: "マイクが許可されていません", code: 1 } });
 
-      expect(yield* cliFailure("start", "--app", "us.zoom.xos")).toContain("マイクが許可されていません");
+      expect(yield* cliFailure("start", "--app", "Zoom.exe")).toContain("マイクが許可されていません");
       yield* cliFailure("stop"); // 進行中のセッションはない
     }));
 
@@ -227,7 +230,7 @@ describe("Helpers の実物 Layer の契約（本物の子プロセス・HTTP・
         unexpectedExit: { afterMs: 300, code: 1 },
         stderrLines: codeLines,
       });
-      yield* cli("start", "--app", "us.zoom.xos", "--title", "週次");
+      yield* cli("start", "--app", "Zoom.exe", "--title", "週次");
       const [dir] = yield* sessionDirs();
       yield* waitFor(() => expect(readFileSync(join(dir!, "log.jsonl"), "utf8")).toContain("intake-stopped"), { timeout: 10_000 });
 
@@ -236,17 +239,19 @@ describe("Helpers の実物 Layer の契約（本物の子プロセス・HTTP・
 
       yield* cli("stop");
 
-      // 同じ 2 つの終わり方を、起動し直し後の signal 側でも確かめる
+      // 同じ 2 つの終わり方を、起動し直し後の signal 側でも確かめる。
+      // Windows では自分への SIGKILL が TerminateProcess になり、親からは code 1・signal 無しとして見える（落ちたことは code で読み取る）
+      const signalExit = process.platform === "win32" ? { code: 1, signal: null } : { code: null, signal: "SIGKILL" };
       const { cli: cli2, sessionDirs: sessionDirs2 } = yield* setup({
         events: [],
         unexpectedExit: { afterMs: 300, signal: "SIGKILL" },
         stderrLines: signalLines,
       });
-      yield* cli2("start", "--app", "us.zoom.xos", "--title", "週次");
+      yield* cli2("start", "--app", "Zoom.exe", "--title", "週次");
       const [dir2] = yield* sessionDirs2();
       yield* waitFor(() => expect(JSON.stringify(readFileSync(join(dir2!, "log.jsonl"), "utf8"))).toContain("intake-stopped"), { timeout: 10_000 });
       const signalEvents = (yield* logEvents(dir2!)).filter((e) => e.type === "intake-stopped");
-      expect(signalEvents[0]).toMatchObject({ code: null, signal: "SIGKILL", stderrTail: signalLines });
+      expect(signalEvents[0]).toMatchObject({ ...signalExit, stderrTail: signalLines });
       yield* cli2("stop");
     }));
 });

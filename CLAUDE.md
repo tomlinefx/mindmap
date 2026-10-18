@@ -78,5 +78,5 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - 環境: Tailscale が常時稼働。閲覧の口を LAN 向けに開けば tailnet 越し（Android）にも同じ bind で届く。Tailscale 固有の対応はコードに入れない（ADR 0003）
 - 閲覧の共有（ADR 0003）: セッション中に `cli share` で閲覧の口（既定 4320、`LIVE_MINDMAP_VIEW_PORT`）を全インターフェースに開き、LAN のアドレスごとの URL（`?pin=` 付き）を出す。Android はその URL をブラウザで開く。`cli share --stop` かセッションの終了で閉じる。初回は Windows Firewall の受信の許可が要る
 - 検証コマンド（WSL から）: `cmd.exe /c 'C:\Users\takah\projects\mindmap\scripts\win-pnpm.cmd typecheck'`（tsc・effect-tsgo・fallow まで）、同 `-r test`（unit）、同 `-r test:it`（軽い IT）、同 `--filter @live-mindmap/server test`。`scripts/win-tsc.cmd` は server の tsc だけ
-- 元の heavy IT（Chromium・本物の子プロセス）は Windows 未検証。web の heavy IT は `LIVE_MINDMAP_CHROMIUM` に Chromium の実行ファイルを渡す
+- heavy IT（Chromium・本物の子プロセス）は Windows で通る（2026-10-18）。web の heavy IT は `LIVE_MINDMAP_CHROMIUM` に Chromium の実行ファイル（Chrome の `chrome.exe` でよい）を渡す: `$env:LIVE_MINDMAP_CHROMIUM = "C:\Program Files\Google\Chrome\Application\chrome.exe"` のうえで `win-pnpm.cmd --filter @live-mindmap/web test:it:heavy`。server は `--filter @live-mindmap/server test:it:heavy`。シグナルの振る舞いそのものを見る 3 件は Windows では skip（ADR 0004）。web の画面照合は他のテストと並走すると稀にピクセル差の許容を超える（単独では通る）
 - 開発サーバー: `scripts/win-dev.cmd [-Server|-Web]` で Windows 側に切り離して起動（PID・ログは `.dev/`）、`scripts/win-dev-stop.cmd` で止める。WSL から呼ぶと interop が子プロセスの標準出力を待って戻らないので、`run_in_background` で呼ぶ
