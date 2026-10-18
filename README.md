@@ -105,7 +105,7 @@ Claude Code からは `/mindmap-start` と `/mindmap-stop` で同じことがで
 
 ## ライセンス
 
-MIT（[LICENSE](LICENSE)）。server と web は live-mindmap（Copyright (c) 2026 Daiki Beppu、MIT）からコピーしたもので、その著作権表示をそのまま残している。helper と Windows 向けの追加分も同じ MIT で出す。
+MIT（[LICENSE](LICENSE)）。server と web は live-mindmap（Copyright (c) 2026 Daiki Beppu、MIT）からコピーしたもので、その著作権表示をそのまま残している。helper と Windows 向けの追加分も同じ MIT で出す。ビルドで取り込む第三者（WebRTC、sherpa-onnx、音声認識のモデルなど）の一覧と表示は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。実行ファイルを配るときは、`dotnet build` が隣に写す `LICENSE`・`THIRD_PARTY_NOTICES.md`・`LICENSES/` を一緒に配る（[ADR 0005](docs/adr/0005-license-mit-with-third-party-notices.md)）。
 
 ## 構成
 

@@ -18,6 +18,10 @@
   <ItemGroup>
     <!-- WebRTC AEC3 のシム（scripts/win-webrtc-apm.cmd が作る）。あれば実行ファイルの隣に写す。無くてもビルドは通り、run はエコーキャンセル無しで動く -->
     <None Include=".deps/webrtc-apm/lib/webrtc-apm.dll" Link="webrtc-apm.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('.deps/webrtc-apm/lib/webrtc-apm.dll')" />
+    <!-- 実行ファイルを配るときに一緒に配る表示（ADR 0005）: 自分の LICENSE、第三者の一覧、dll に静的リンクした各ライセンスの全文 -->
+    <None Include="../LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../THIRD_PARTY_NOTICES.md" Link="THIRD_PARTY_NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+    <None Include=".deps/webrtc-apm/lib/LICENSES/*" Link="LICENSES/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

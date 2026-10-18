@@ -17,7 +17,22 @@ $RepoUrl = "https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing.gi
 $Commit = "d0569cfa50c1858ee279d77b3fc8870be6902441" # v2.1 の後。上流が #110 でビルドと効き目を確かめた版
 $UvUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
 
-if ((Test-Path $dll) -and -not $Force) { Write-Host "webrtc-apm: already built ($dll)"; exit 0 }
+# 静的リンクする各ライセンスの全文を lib\LICENSES に集める（バイナリを配るときに一緒に配る。THIRD_PARTY_NOTICES.md、ADR 0005）
+function Copy-Licenses {
+  if (-not (Test-Path $src)) { return }
+  $licenses = Join-Path $lib "LICENSES"
+  New-Item -ItemType Directory -Force $licenses | Out-Null
+  Copy-Item (Join-Path $src "COPYING") (Join-Path $licenses "webrtc-audio-processing.COPYING.txt")
+  Copy-Item (Join-Path $src "webrtc\LICENSE") (Join-Path $licenses "webrtc.LICENSE.txt")
+  Copy-Item (Join-Path $src "webrtc\PATENTS") (Join-Path $licenses "webrtc.PATENTS.txt")
+  Copy-Item (Join-Path $src "webrtc\third_party\pffft\LICENSE") (Join-Path $licenses "pffft.LICENSE.txt")
+  Copy-Item (Join-Path $src "webrtc\third_party\rnnoise\COPYING") (Join-Path $licenses "rnnoise.COPYING.txt")
+  $abseilLicense = Get-ChildItem (Join-Path $src "subprojects") -Directory -Filter "abseil-cpp*" | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName "LICENSE" }
+  if ($abseilLicense -and (Test-Path $abseilLicense)) { Copy-Item $abseilLicense (Join-Path $licenses "abseil-cpp.LICENSE.txt") }
+  Write-Host "webrtc-apm: licenses in $licenses"
+}
+
+if ((Test-Path $dll) -and -not $Force) { Write-Host "webrtc-apm: already built ($dll)"; Copy-Licenses; exit 0 }
 
 # MSVC の環境（vcvars64.bat）。vswhere で VC ツールの入った VS を探す
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -70,4 +85,5 @@ $libs = (Get-ChildItem $lib -Include *.a, *.lib -Recurse | ForEach-Object { "`"$
 $defines = "/DWEBRTC_WIN /D_WIN32 /DNOMINMAX /D_USE_MATH_DEFINES /D_WINSOCKAPI_ /DNDEBUG /DWEBRTC_APM_DEBUG_DUMP=0"
 $includes = "/I`"$src`" /I`"$src\webrtc`" /I`"$build`" /I`"$($abseil.FullName)`""
 Invoke-Vc "cl /nologo /O2 /MT /EHsc /std:c++20 /utf-8 $defines $includes /LD `"$native\apm.cpp`" /Fo`"$build\apm.obj`" /Fe`"$dll`" /link $libs winmm.lib"
+Copy-Licenses
 Write-Host "webrtc-apm: built $dll"
