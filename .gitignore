@@ -7,8 +7,8 @@ dist/
 .takt/
 .build/
 
-# WebRTC AEC3 のビルド結果（helper/scripts/build-webrtc-apm.sh が作る）
-helper/.deps/webrtc-apm/
+# WebRTC AEC3 のビルド結果と、そのビルドに使う uv（scripts/win-webrtc-apm.cmd が作る）
+helper/.deps/
 
 # playwright-cli が録画・操作のたびに書く作業ファイル
 .playwright-cli/

@@ -16,6 +16,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- WebRTC AEC3 のシム（scripts/win-webrtc-apm.cmd が作る）。あれば実行ファイルの隣に写す。無くてもビルドは通り、run はエコーキャンセル無しで動く -->
+    <None Include=".deps/webrtc-apm/lib/webrtc-apm.dll" Link="webrtc-apm.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('.deps/webrtc-apm/lib/webrtc-apm.dll')" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="NAudio" Version="2.2.1" />
     <PackageReference Include="org.k2fsa.sherpa.onnx" Version="1.13.8" />
   </ItemGroup>

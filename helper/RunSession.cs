@@ -81,8 +81,16 @@ public sealed class RunSession
             using var otherCapture = other;
             self.Paused = selfPaused;
 
-            Wire(selfCapture, selfStt, Track.Self, socket);
-            Wire(otherCapture, otherStt, Track.Other, socket);
+            // スピーカー漏れを自分のトラックから消す（WebRTC AEC3）。シムの dll が無い・作れないときは、知らせたうえで無しで続ける（欠けても字幕とマップは出る）
+            EchoCancellation? echo = null;
+            try { echo = new EchoCancellation(); }
+            catch (DllNotFoundException) { Console.Error.WriteLine("WebRTC AEC3 のライブラリ（webrtc-apm.dll）が無いので、エコーキャンセル無しで続けます（scripts/win-webrtc-apm.cmd で作る）"); }
+            catch (InvalidOperationException e) { Console.Error.WriteLine($"WebRTC AEC3 を初期化できないので、エコーキャンセル無しで続けます: {e.Message}"); }
+            using var echoCancellation = echo;
+
+            Wire(selfCapture, selfStt, Track.Self, socket, echo);
+            Wire(otherCapture, otherStt, Track.Other, socket, null);
+            if (echo is not null) otherCapture.OnSamples += echo.PushReference;
 
             // 相手の音が 10 秒届かなければ知らせる（origin からの秒）
             var lastOtherAudio = Now;
@@ -105,7 +113,7 @@ public sealed class RunSession
             otherCapture.Start();
             if (selfPaused) SendSelfPause(true);
             var otherSource = pid is int p ? $"{app}（PID {p}）の Process Loopback" : "再生デバイスの loopback";
-            Console.Error.WriteLine($"取得を始めました（自分: マイク、相手: {otherSource}、ポート {port}）");
+            Console.Error.WriteLine($"取得を始めました（自分: マイク、相手: {otherSource}、エコーキャンセル: {(echo is null ? "無し" : "WebRTC AEC3")}、ポート {port}）");
 
             using var registration = cancel.Register(() => exit.TrySetResult(0));
             var code = await exit.Task;
@@ -116,8 +124,8 @@ public sealed class RunSession
 
     }
 
-    /// <summary>トラックの取得を STT につなぎ、結果を原点からの秒に直して送る。</summary>
-    private void Wire(Capture capture, ITranscriber stt, string track, WebSocketServer socket)
+    /// <summary>トラックの取得を STT につなぎ、結果を原点からの秒に直して送る。echo があれば、取得した音を漏れを消してから STT に渡す（自分のトラック）。</summary>
+    private void Wire(Capture capture, ITranscriber stt, string track, WebSocketServer socket, EchoCancellation? echo)
     {
         var trackStart = Now; // トラック内の 0 秒が原点から何秒か
         stt.OnResult += result => socket.Send(Events.Remark(track, result with {
@@ -125,6 +133,11 @@ public sealed class RunSession
             End = trackStart + result.End,
             WordTimes = result.WordTimes?.Select(w => w with { start = trackStart + w.start, end = trackStart + w.end }).ToList(),
         }));
-        capture.OnSamples += stt.Push;
+        if (echo is null) capture.OnSamples += stt.Push;
+        else
+        {
+            capture.OnSamples += echo.PushSelf;
+            echo.OnSamples += stt.Push;
+        }
     }
 }
