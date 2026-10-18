@@ -1,0 +1,20 @@
+{
+  "name": "mindmap",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@12.11.2",
+  "scripts": {
+    "fallow": "fallow --fail-on-issues",
+    "cli": "cd server && node src/cli.ts",
+    "dev": "pnpm -r --parallel run dev",
+    "test": "pnpm -r test",
+    "test:it": "pnpm -r run test:it",
+    "test:it:heavy": "pnpm -r run test:it:heavy",
+    "test:it:all": "pnpm -r run test:it:all",
+    "typecheck": "pnpm -r typecheck && pnpm fallow"
+  },
+  "devDependencies": {
+    "fallow": "3.33.1"
+  }
+}

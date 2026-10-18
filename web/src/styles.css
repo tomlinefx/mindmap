@@ -1,0 +1,182 @@
+/* Tailwind v4（Issue #830）の入口。Preflight は入れない（theme.css と utilities.css だけを import する）。
+   既定のテーマは `--*: initial` で消し、今の色を今の hex のまま token にする。走査は utilities の source(none) で自動をやめ、@source で web/src だけを読む。
+   ユーティリティは view の h.Class に意味のクラス名と並べて書く（JS の closest()・scene テスト・下の素の CSS がその名前を使う）。
+   下の素の CSS は層（@layer）の外に置く: 層の外はユーティリティに勝つので、点滅・子孫と状態のセレクタ・min()/calc() の長い値・color-mix の規則が基本の値を上書きできる。
+   影は付けない（shadow-* は使わない。既定の影の token も置かない）。 */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities) source(none);
+@source "./";
+
+@theme static {
+  --*: initial;
+  /* 数のユーティリティ（min-w-0 など）が calc(var(--spacing) * n) になるので、1px にして今の px と合わせる */
+  --spacing: 1px;
+  --color-white: #fff;
+  --color-gray-50: #f9fafb;
+  --color-gray-100: #f3f4f6;
+  --color-gray-200: #e5e7eb;
+  --color-gray-400: #9ca3af;
+  --color-gray-500: #6b7280;
+  --color-gray-600: #4b5563;
+  --color-gray-700: #374151;
+  --color-gray-900: #111827;
+  --color-yellow-400: #facc15;
+  --color-green-800: #166534;
+  --color-orange-700: #c2410c;
+  --font-weight-semibold: 600;
+}
+
+html, body, #root { margin: 0; width: 100%; height: 100%; }
+body { font-family: system-ui, "Hiragino Sans", sans-serif; background: var(--color-white); }
+
+.local-mode-line, .local-mode-notice { --local-mode-color: var(--color-green-800); }
+.local-mode-line[data-status="restarting"], .local-mode-notice[data-status="restarting"] { --local-mode-color: var(--color-orange-700); }
+.local-mode-line[data-status="stopped"], .local-mode-notice[data-status="stopped"] { --local-mode-color: var(--color-gray-500); }
+.layout--local > .screen-notice { top: 36px; width: min(720px, calc(100% - 24px)); }
+
+/* 淡い塗り・枠・角丸だけ。影・バッジ・色帯は付けない */
+.map-node {
+  box-sizing: border-box;
+  width: 200px;
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--color-gray-900);
+  background: color-mix(in srgb, var(--kind-color) 15%, white);
+  border: 1.5px solid var(--kind-color);
+  border-radius: 8px;
+  box-shadow: none;
+  position: relative;
+}
+/* 余白・並びは内側のボタンが持つ（外側は枠と塗りだけ。実寸は変えない） */
+.map-node__button { display: flex; gap: 6px; align-items: baseline; width: 100%; padding: 8px 12px; border: 0; background: none; font: inherit; color: inherit; text-align: left; cursor: pointer; pointer-events: all; position: relative; }
+.map-node__mark { flex: none; font-weight: 600; color: var(--kind-color); }
+.map-node__text { overflow-wrap: anywhere; }
+/* 今回の反映で変わったノードは、ノードの塗りと枠だけを 1 秒周期で 3 回ゆっくり薄くして戻す。
+   文字は薄くしない（opacity はノード全体にかかるので使わない）。影・バッジは足さない。
+   色の塗りで知らせる案・ノード全体の opacity で点滅する案は、実機で違和感があったため取りやめた（2026-10-01）。
+   50% だけを指定し、始まりと終わりは元の塗り・枠の色から補間させる。
+   枠は細い黄色を outline で描き、次の反映まで残す（border の太さを変えると実寸が変わり、測った高さに基づく配置がずれる）。
+   点滅は animate-* のユーティリティにせず、素の CSS に残す。 */
+.map-node--blink { outline: 1.5px solid #facc15; outline-offset: 2px; animation: map-node-blink 1s ease-in-out 3; }
+@keyframes map-node-blink { 50% { background-color: color-mix(in srgb, var(--kind-color) 4%, white); border-color: color-mix(in srgb, var(--kind-color) 35%, white); } }
+.map-node--rejected { opacity: 0.45; }
+.map-node--rejected .map-node__text { text-decoration: line-through; }
+/* 畳んだノード: 塗りを薄く、文字を灰色にし、手がかりの文字と、右端に隠れたノード数の小さな丸を出す。影・バッジは付けない */
+.map-node--folded { color: var(--color-gray-500); background: color-mix(in srgb, var(--kind-color) 6%, white); }
+/* 選んだノード: 種別の色の塗りを薄い灰色に置き換える。枠・点滅の outline・影・バッジは変えない（枠を変えると実寸が変わり配置がずれる） */
+.map-node--selected { background: var(--color-gray-100); }
+.map-node__hint { flex-basis: 100%; font-size: 12px; color: var(--color-gray-500); }
+.map-node--folded .map-node__button { flex-wrap: wrap; padding-right: 32px; }
+.map-node__count { position: absolute; top: 50%; right: 6px; transform: translateY(-50%); min-width: 18px; height: 18px; padding: 0 4px; box-sizing: border-box; border-radius: 9px; background: var(--color-gray-200); color: var(--color-gray-600); font-size: 11px; line-height: 18px; text-align: center; pointer-events: none; }
+/* 開閉できる丸（onFoldDot がある畳んだノード）だけ押せる */
+.map-node__count--pressable { pointer-events: all; cursor: pointer; border: 0; margin: 0; font-family: inherit; }
+.map-node__count--pressable:focus-visible { outline: 2px solid #facc15; }
+/* 人が開いたノードの、畳む小さな丸: ホバーか :focus-visible のときだけ出す（opacity で隠し、Tab で届くようにする）。絶対配置で、ノードの実寸は変えない */
+.map-node__fold-dot { position: absolute; top: 50%; right: 6px; transform: translateY(-50%); width: 12px; height: 12px; border-radius: 50%; background: var(--color-gray-200); border: 1px solid var(--color-gray-400); box-sizing: border-box; display: block; opacity: 0; padding: 0; margin: 0; cursor: pointer; pointer-events: all; }
+.map-node:hover .map-node__fold-dot { opacity: 1; }
+.map-node__fold-dot:focus-visible { opacity: 1; outline: 2px solid #facc15; }
+
+/* 右の列・「変わったこと」の中の要素（子孫のセレクタ） */
+.evidence h2 { margin: 0 0 8px; font-size: 14px; }
+.evidence p { margin: 0 0 6px; }
+.evidence ul { margin: 0; padding: 0; list-style: none; }
+.todos h2 { margin: 0 0 8px; font-size: 14px; }
+.todos ul { margin: 0; padding: 0; list-style: none; }
+.todos p { margin: 0; }
+.changes h2 { margin: 0 0 8px; font-size: 14px; }
+.changes ul { margin: 0; padding: 0; list-style: none; }
+
+/* 字幕（いま話している文字）: .layout の下端に重ね、.layout の横幅の中央に固定する（右の列を出し入れしても動かない）。
+   幅は右の列（300px）の分を引いても収まる min(720px, 100vw − 2 × 316px)。fixed にすると、見返しで .layout の下の操作の行に重なるため使わない。白の半透明の帯と灰色の文字だけで、影・バッジは付けない。
+   文ごとに 1 行。古い文は行ごと消える（文字単位で前から削ると目が滑るため、2026-10-02） */
+.captions { position: absolute; left: 50%; bottom: 24px; transform: translateX(-50%); width: min(720px, calc(100vw - 2 * 316px)); display: flex; flex-direction: column; gap: 4px; pointer-events: none; z-index: 5; }
+
+/* 会議中の字幕の吹き出し（Issue #1022）: 行は「名前の欄（固定幅）+ 吹き出し」。吹き出しの幅は、名前の欄を除いた列に --caption-bubble-ratio（view が定数から渡す）を掛けた固定の値で、文字の量では伸び縮みしない。
+   枠は試作の案 E（prototype/speaker-captions）の形: 白の半透明の塗りと細い灰色の線、角丸で、話し手の側の下の角だけ小さくして吹き出しに見せる。自分（右）は薄い灰色で塗る。
+   塗りは話者で色分けせず、文字の色だけを話者ごとに変える。影・バッジは付けない。幅は枠と余白を含めて固定（border-box）。位置が変わるときの動きは Mount（SlideCaptions）が付ける */
+.captions { --caption-name-width: 72px; }
+.captions__bubble { width: calc(var(--caption-bubble-ratio) * (100% - var(--caption-name-width) - 8px)); box-sizing: border-box; padding: 5px 12px; background: rgb(255 255 255 / 0.92); border: 1px solid var(--color-gray-200); border-radius: 12px 12px 12px 4px; box-shadow: none; }
+.captions__bubble--right { background: rgb(243 244 246 / 0.95); border-radius: 12px 12px 4px 12px; }
+/* 途中の分の末尾のカーソル。幅 2px は右の margin -2px で行の中の幅を取らせず、折り返しも吹き出しの幅も変えない */
+.captions__cursor { display: inline-block; width: 2px; height: 1em; margin-right: -2px; vertical-align: -0.1em; background-color: currentColor; animation: caption-cursor-blink 1s steps(1) infinite; }
+@keyframes caption-cursor-blink { 50% { visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) { .captions__cursor { animation: none; } }
+
+/* 取り込みの状態の一言（字幕の横。Issue #161）: バッジ・影は重ねず、控えめな文字だけで出す。
+   .captions の右端（中央から幅 min(720px, 100vw − 2 × 316px) の半分）の 12px 外に置く。
+   transform: translate() の % は要素自身の幅が基準になり、.captions の幅を基準にできないため、
+   同じ % が .layout（直近の absolute 位置指定の親）を基準に解決される left の calc() で配置する（2026-10-05）。
+   C で字幕を隠しても、この一言は隠さず今の位置に残す */
+.intake-notice { position: absolute; left: calc(50% + min(720px, calc(100vw - 2 * 316px)) / 2 + 12px); bottom: 24px; font-size: 13px; color: var(--color-gray-500); pointer-events: none; z-index: 5; white-space: nowrap; }
+
+/* 相手の音声が届いていないことの一文（Issue #863）: 字幕の左に、下端基準で置く（右には .intake-notice がある）。
+   文が長いので折り返しを許し、幅は字幕の左の余白に収める。レイアウトは動かさない（absolute）。バッジ・影・枠・背景は付けない */
+/* 自分を休止中の一言（Issue #1069）: 取り込みの一言と同じ場所・同じ文字で字幕の右に出し続ける。取り込みの一言と同時に出るときは、
+   取り込みの一言を 1 行分（line-height 1.5 の 19.5px）より上へ上げ、休止の一言をその下に置く。包む要素は足さない（字幕・マップを動かさない）。
+   自動の文言は長く、字幕の右の余白に 1 行では収まらない（769px 以上）ので、右端を .layout の右端に合わせて折り返しを許す。
+   上端を「下から 24px + 1 行分」に固定し、折り返した行は下へ伸ばす（1 行のときの下端は従来どおり layout −24px） */
+.self-pause-notice { position: absolute; left: calc(50% + min(720px, calc(100vw - 2 * 316px)) / 2 + 12px); right: 0; top: calc(100% - 24px - 19.5px); font-size: 13px; line-height: 1.5; color: var(--color-gray-500); pointer-events: none; z-index: 5; white-space: normal; }
+.layout:has(> .self-pause-notice) > .intake-notice { bottom: 44px; line-height: 1.5; }
+.tap-notice { position: absolute; right: calc(50% + min(720px, calc(100vw - 2 * 316px)) / 2 + 12px); bottom: 24px; width: 260px; text-align: right; font-size: 13px; line-height: 1.5; color: var(--color-gray-500); pointer-events: none; z-index: 5; }
+
+/* 共有画面を使っていないことの一文（Issue #280）: .layout の上端中央に重ねる。レイアウトは動かさない（absolute）。
+   字幕と取り込みの一言（どちらも下端）とは重ならない。幅は字幕と同じ式で、長い文は折り返す。バッジ・影は付けない */
+.screen-notice { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); width: min(720px, calc(100vw - 2 * 316px)); text-align: center; font-size: 13px; line-height: 1.5; color: var(--color-gray-500); pointer-events: none; z-index: 5; }
+
+/* キー一覧: Popover が left・top を書くので、右の位置（top 12px・right 12px）は外し、中身の大きさに合わせる */
+.key-list__anchor .key-list { right: auto; width: max-content; }
+
+/* 見返し（map.html）のシークバー: ポインタを乗せている間・ドラッグ中は、トラックを太くし、つまみと吹き出しを出す。つまみは display: none や visibility: hidden では隠さない（Tab でフォーカスできなくなる） */
+.review-seek[data-pointing] .review-seek__track, .review-seek[data-dragging] .review-seek__track { top: 5px; height: 5px; }
+.review-seek[data-pointing] .review-seek__thumb, .review-seek[data-dragging] .review-seek__thumb, .review-seek__thumb:focus-visible { opacity: 1; }
+.review-seek__thumb:focus-visible { outline: 2px solid #facc15; }
+.review-seek[data-pointing] .review-seek__preview, .review-seek[data-dragging] .review-seek__preview { display: flex; }
+.review-bar__button svg { width: 18px; height: 18px; }
+
+/* 音量: ミュートのボタンにポインタを乗せている間（ドラッグ中・キーボードのフォーカス中も）だけ、横にスライダーが出る。幅 0 で隠すのでフォーカスは保てる */
+.review-volume:hover .review-volume__slider, .review-volume:focus-within .review-volume__slider, .review-volume__slider[data-dragging] { width: 64px; margin: 0 4px; opacity: 1; }
+.review-volume__thumb:focus-visible { outline: 2px solid #facc15; }
+
+/* ツールチップ: panel は常に描き、Tooltip が data-open を付けている間だけ出す（:hover の規則は panel が body へ移るので効かない）。位置は Floating UI が inline の left/top で書くので、left・right・top・bottom は書かない（Issue #1226） */
+.review-tip[data-open] { display: block; }
+.review-bar__button:hover > .review-tip { display: block; }
+.review-bar__button.review-rate__button { width: auto; gap: 4px; padding: 0 8px; }
+
+/* 速さのメニューの項目: 矢印キーなどで選んでいる項目は Menu が data-active だけを付けるので、:hover・:focus-visible の強調と同じ色にそろえる */
+.review-rate__item:hover, .review-rate__item:focus-visible { background: var(--color-gray-600); }
+.review-rate__item[data-active] { background: var(--color-gray-600); }
+.review-rate__check svg { width: 16px; height: 16px; }
+
+/* 根拠のシートの閉じるボタン: 広い幅（と見返し）では出さない。狭い幅の会議中だけ下の @media が出す */
+.side__close { display: none; }
+
+/* 右の列を隠していて、ノードを選んでいる状態の .side: 広い幅と見返しでは見せない。狭い幅の会議中だけ、下の @media の .meeting .side--selected が出す */
+.side--hidden { display: none; }
+
+/* 狭い幅（スマホ・縦向きの iPad。Issue #969）: 幅 768px 以下の会議中の画面（.meeting。見返しには付かない）だけ並べ方を替える。見る人かどうかは区別しない。
+   DOM は変えず、.layout を CSS グリッドにする。列は左右 12px の余白と中身、行は下から 24px の余白・字幕・取り込みの知らせ・共有画面の知らせ（空の行は高さ 0）。
+   .map は全てのマスに広げる（右の列は絶対配置なので .map の大きさは変わらず、カメラが動き直さない）。シートは淡い塗り・枠・角丸だけで、影は付けない。
+   769px 以上の規則（上）は書き換えない */
+@media (max-width: 768px) {
+  .meeting .layout { display: grid; grid-template-columns: 12px minmax(0, 1fr) 12px; grid-template-rows: minmax(0, 1fr) auto auto auto auto 24px; }
+  .meeting .layout > .map { grid-column: 1 / -1; grid-row: 1 / -1; width: auto; height: auto; min-width: 0; }
+  .meeting .captions { position: relative; left: auto; bottom: auto; transform: none; width: auto; grid-column: 2; grid-row: 5; }
+  .meeting .intake-notice, .meeting .self-pause-notice, .meeting .screen-notice, .meeting .layout--local > .screen-notice {
+    position: relative; left: auto; top: auto; bottom: auto; transform: none; width: auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.5; text-align: center; z-index: 5;
+  }
+  .meeting .intake-notice { grid-column: 2; grid-row: 3; }
+  .meeting .self-pause-notice { grid-column: 2; grid-row: 4; }
+  .meeting .screen-notice, .meeting .layout--local > .screen-notice { grid-column: 2; grid-row: 2; }
+  .meeting .changes, .meeting .todos, .meeting .key-list__anchor, .meeting .side { display: none; }
+  .meeting .side--selected {
+    display: flex; position: absolute; left: 0; right: 0; bottom: 0; width: auto; height: auto; max-height: 50%;
+    box-sizing: border-box; background: var(--color-white); border: 0; border-top: 1px solid var(--color-gray-200); border-radius: 12px 12px 0 0; box-shadow: none; z-index: 6;
+  }
+  .meeting .side--selected .evidence { position: relative; border-bottom: 0; }
+  .meeting .side__close {
+    display: block; position: absolute; top: 8px; right: 12px; padding: 4px 10px; font: inherit; font-size: 13px; color: var(--color-gray-700);
+    background: var(--color-gray-50); border: 1px solid var(--color-gray-200); border-radius: 8px; box-shadow: none; cursor: pointer;
+  }
+}

@@ -1,0 +1,186 @@
+// セッションの中身（updater・ログ・いま話している文字・書き出し）を開く（上流 ADR 0008）。
+// core のセッションを直接使う。updater はセッションの Scope の資源で、Scope を閉じると閉じる。
+import { Context, DateTime, Effect, FileSystem, Layer, Ref, Scope, Semaphore } from "effect";
+import type { UpdaterUnavailable } from "./updaterUnavailable.ts";
+import type { ExecutableModel } from "./modelSelection.ts";
+import { createSessionDir, openLoggedSession, writeSessionExports } from "./sessionFiles.ts";
+import { DiffUpdater, nameSpeaker, speakerNameMap, speakerNamesFrame, type DiffUpdateFrame, type HelperPartial, type IntakeLogEvent, type SelfPauseLogEvent, type SpeakerNameChange, type SpeakerNameTable, type SpeakerNamesFrame, type SettledRemark, type SpeakerLogEvent, type Snapshot, type CaptionsFrame, type Replacement, type WordTime } from "./core/index.ts";
+import { createRemarkSettling } from "./remarkSettling.ts";
+import { ReviewBuild } from "./review.ts";
+import { createSpeakingRelay, type CaptionContext } from "./speakingRelay.ts";
+import { SpeakerNameRejected } from "./sessionFailure.ts";
+import { errorMessage } from "./truthFile.ts";
+
+// 開いたセッション 1 つ。ヘルパーに依らず、起動し直しをまたいで 1 つを使い続ける
+export type SessionSink = {
+  dir: string;
+  // ヘルパーの途中結果。いま話している文字（speaking）と、1 秒更新されなかった発話の発言化（settling）へ渡す
+  partial: (p: HelperPartial) => Effect.Effect<void>;
+  // ヘルパーの確定結果。発言は、確定結果と 1 秒更新されなかった途中結果のどちらからも差分更新・ログ・speaking へ届く
+  final: (r: SettledRemark) => Effect.Effect<void>;
+  // 確定結果に覆われなかった最後の発話を発言にする
+  drain: Effect.Effect<void>;
+  // いま話している文字を空にする（以後も送れる。取り込みの途切れの瞬間に使う）
+  clearSpeaking: Effect.Effect<void>;
+  // 予約を取り消し、いま話している文字を空にして、以後は何も送らない
+  stopRelays: Effect.Effect<void>;
+  // ヘルパーの話者の区間と使えないこと。受け取った値のまま、届いた順に log.jsonl へ残してから、相手の発言の話者を決める段へ渡す。
+  // 初版のヘルパーは流さない（話者分離は作らない。ADR 0001）が、イベントの形は上流のまま保つ
+  speaker: (event: SpeakerLogEvent) => Effect.Effect<void>;
+  // ヘルパーを起動し直して接続できた。新しいヘルパーのイベントを読み始める前に呼ぶ
+  speakersRenumbered: Effect.Effect<void>;
+  // 話者のラベル（相手 B）に名前を手で付ける。付けられるのは発言に振ったラベルだけで、自分・まだ振っていないラベル・ラベルの無い「相手」・空の名前は SpeakerNameRejected。
+  // 表が変わるときだけ、log.jsonl に speaker-name の行を残し、名前の表のフレームを送る。以後の差分更新の入力に載る。名前は外れない
+  nameSpeaker: (speaker: { label: string; name: string }) => Effect.Effect<void, SpeakerNameRejected>;
+  // log.jsonl へ、取り込みの途切れ・自分の休止等の記録を追記する（話者の記録は speaker が行う）
+  appendLog: (event: Exclude<IntakeLogEvent, SpeakerLogEvent> | SelfPauseLogEvent) => Effect.Effect<void>;
+  // 差分更新の結果を待つ
+  flush: Effect.Effect<void>;
+  // map.md・map.json・map.drawnix（と書き出せれば map.html）を書き出し、パスを返す
+  exports: Effect.Effect<string[]>;
+};
+
+export type SessionSinksDeps<R = never> = {
+  // モデルから差分更新の layer を作る
+  prepareUpdater: (model: ExecutableModel) => Effect.Effect<Layer.Layer<DiffUpdater, UpdaterUnavailable>, UpdaterUnavailable, R | Scope.Scope>;
+};
+
+export type OpenSessionSink = {
+  model: ExecutableModel;
+  updaterLayer: Layer.Layer<DiffUpdater, UpdaterUnavailable>;
+  dir: string; // createDir で作ったセッションのフォルダ
+  title: string | undefined; // 省略したときは、セッションのフォルダ名（開始時刻）
+  publish: (snapshot: Snapshot) => Effect.Effect<void>;
+  speak: (frame: CaptionsFrame) => Effect.Effect<void>;
+  // 話者の名前の表（全体）を送る。開いた直後に空の表を 1 回送り、前のセッションの名前を消す
+  speakerNames: (frame: SpeakerNamesFrame) => Effect.Effect<void>;
+  diffUpdate: (frame: DiffUpdateFrame) => Effect.Effect<void>;
+};
+
+export class SessionSinks extends Context.Service<SessionSinks, {
+  prepare: SessionSinksDeps["prepareUpdater"];
+  // セッションのフォルダを作る。起動の前に確定させる。失敗したら以後 open を呼ばない
+  createDir: (sessionsDir: string, at?: DateTime.DateTime) => Effect.Effect<string>;
+  // セッションの Scope の中で 1 回開く。Scope を閉じると updater が閉じ、予約が止まる
+  open: (args: OpenSessionSink) => Effect.Effect<SessionSink, never, Scope.Scope>;
+}>()("live-mindmap/server/SessionSinks") {
+  // 終了時の書き出しが使う見返し用の HTML のビルドと FileSystem は、Layer を作るときに文脈から 1 回だけ受け取る
+  static readonly layer = <R>({ prepareUpdater }: SessionSinksDeps<R>): Layer.Layer<SessionSinks, never, R | ReviewBuild | FileSystem.FileSystem> =>
+    Layer.effect(SessionSinks)(
+      Effect.gen(function* () {
+        const preparationServices = yield* Effect.context<R>();
+        const exportServices = Context.pick(ReviewBuild, FileSystem.FileSystem)(
+          yield* Effect.context<ReviewBuild | FileSystem.FileSystem>(),
+        );
+        return SessionSinks.of({
+        prepare: (model) => Effect.gen(function* () {
+          const scope = yield* Effect.scope;
+          return yield* prepareUpdater(model).pipe(Effect.provideContext(Context.add(preparationServices, Scope.Scope, scope)));
+        }),
+        createDir: (sessionsDir, at) => createSessionDir(sessionsDir, at).pipe(Effect.provideContext(exportServices), Effect.orDie),
+        open: Effect.fnUntraced(function* ({ dir, title, publish, speak, speakerNames, diffUpdate, model, updaterLayer }) {
+          // updater を開く。Layer はメモ化されるので、Layer.fresh でセッションごとに別の実体にする（query を使い回さない）。
+          // 最後の消費者は session.flush の差分更新で、Scope の後始末はそれより後に走る。開けなければ defect
+          const updaterContext = yield* Layer.build(Layer.fresh(updaterLayer)).pipe(Effect.orDie);
+          // 話者の名前の表（ラベル → 名前）。セッションにつき 1 つで、ヘルパーの起動し直しでは作り直さない。
+          // 開いた直後に空の表を送り、前のセッションの名前を画面から消す
+          const names = yield* Ref.make<SpeakerNameTable>(new Map());
+          const namesLock = yield* Semaphore.make(1);
+          yield* speakerNames(speakerNamesFrame(new Map()));
+          // 差分更新を呼ぶたびに、そのときの名前の表を入力に載せる（名前が無いときはキーごと付けない）
+          const baseUpdater = Context.get(updaterContext, DiffUpdater);
+          const namedUpdater = DiffUpdater.of({
+            ...baseUpdater,
+            update: (input) => Effect.flatMap(Ref.get(names), (table) =>
+              baseUpdater.update(table.size === 0 ? input : { ...input, speakerNames: speakerNameMap(table) })),
+          });
+          // 名前を付ける 1 つの口（手入力も AI の推定も通る）。規則は nameSpeaker にある。
+          // Why: 要求が途中で中断されると、表・ログの行・フレームの一部だけが更新され、同じ名前の再送では直らない（同じ値は何もしない）ため、ロック取得後は中断させない
+          const applyName = (change: SpeakerNameChange): Effect.Effect<void> =>
+            namesLock.withPermit(Effect.uninterruptible(Effect.gen(function* () {
+              const next = nameSpeaker(yield* Ref.get(names), change);
+              if (next === undefined) return;
+              yield* appendRecordedLog({ type: "speaker-name", label: change.label, name: next.get(change.label)!.name, source: change.source });
+              yield* Ref.set(names, next);
+              yield* speakerNames(speakerNamesFrame(next));
+            })));
+          // relay を先に作る。context は session と settling ができた後（onDiff・途中結果が走るとき）にだけ評価されるので、Effect.suspend で遅らせる
+          // 字幕用の表（発言の id → 本文・wordTimes）。Remark には入れず、未反映の発言を盤へ渡すときだけ上書きする（語ごとの時刻は Remark に残らない）
+          const captionTexts = yield* Ref.make<ReadonlyMap<string, { readonly text: string; readonly wordTimes: readonly WordTime[]; readonly replacements: readonly Replacement[] }>>(new Map());
+          const relay = yield* createSpeakingRelay({
+            context: Effect.suspend((): Effect.Effect<CaptionContext> =>
+              Effect.zipWith(session.unreflectedRemarks, Ref.get(captionTexts), (remarks, captions): CaptionContext => ({
+                unreflected: remarks.map(({ id, ...remark }) => {
+                  const caption = captions.get(id);
+                  return caption === undefined ? { id, remark } : { id, remark: { ...remark, text: caption.text, wordTimes: caption.wordTimes }, replacements: caption.replacements };
+                }),
+                held: settling.preview.heldRemarks(),
+                intervals: settling.preview.segments(),
+                previewLabel: settling.preview.label,
+              })),
+            ),
+            send: speak,
+          });
+          // ログを書くセッションは、反映が終わるたびに onDiff を知らせる。未反映の発言が変わるので、いま話している文字を送り直す
+          const { session, appendLog: appendRecordedLog } = yield* openLoggedSession({
+            dir,
+            title,
+            model,
+            publish,
+            diffUpdate,
+            onDiff: relay.flushAll,
+            // 根拠の確かめは core が済ませている。1 件ずつ順に、規則（付け替えは名乗りのときだけ）を通して入れる
+            onSpeakerNames: (inferred) => Effect.forEach(inferred, ({ label, name, basis }) => applyName({ label, name, source: "推定", basis }), { discard: true }),
+          }).pipe(Effect.provideService(DiffUpdater, namedUpdater), Effect.provideContext(exportServices));
+          // ID の採番はセッションにつき 1 回だけ作る。起動し直しでは作り直さない
+          const count = yield* Ref.make(0);
+          // 締めた発言を、採番してセッションへ入れる（ログの remark の行・差分更新・字幕）。
+          // words と wordTimes は Remark に入れず、ログの行にだけ残す（語彙補正は初版では無いので、本文は締めたまま）
+          const admit = (settled: SettledRemark) =>
+            Effect.gen(function* () {
+              const { words, wordTimes, ...rest } = settled;
+              const n = yield* Ref.updateAndGet(count, (c) => c + 1);
+              const id = `r${n}`;
+              // 語ごとの時刻は、表へ入れる（session.push の前に。push で未反映になった発言を盤が時刻つきで受けるため）。
+              // 未反映でなくなった発言の項目は、ここで捨てる
+              if (wordTimes !== undefined) {
+                const unreflected = new Set((yield* session.unreflectedRemarks).map((r) => r.id));
+                const entry = { text: rest.text, wordTimes, replacements: [] };
+                yield* Ref.update(captionTexts, (table) => new Map([...table].filter(([key]) => unreflected.has(key)).concat([[id, entry]])));
+              }
+              yield* session.push({ ...rest, id }, words === undefined ? undefined : { raw: rest.text, words }, wordTimes);
+              yield* relay.remark(rest.track);
+            });
+          const settling = yield* createRemarkSettling({ emit: admit });
+          // 登録の逆順に走る: 予約を止めてから updater を閉じる
+          yield* Effect.addFinalizer(() => Effect.andThen(relay.stop, settling.stop));
+
+          return {
+            dir,
+            // 字幕へは、settling が当てはめた後の、もう発言になった分を除いた途中結果を渡す（この結果で出た発言も除く）
+            partial: (p) => Effect.andThen(settling.partial(p), Effect.suspend(() => relay.partial(settling.preview.unemittedTail(p)))),
+            final: (r) => settling.final(r),
+            speaker: (event) => Effect.andThen(Effect.andThen(appendRecordedLog(event), settling.speaker(event)), relay.speaker(event)),
+            speakersRenumbered: settling.renumbered,
+            nameSpeaker: ({ label, name }) =>
+              Effect.gen(function* () {
+                if (!settling.labels().includes(label)) return yield* new SpeakerNameRejected({ reason: "ラベルがない" });
+                if (name.trim() === "") return yield* new SpeakerNameRejected({ reason: "名前が空" });
+                yield* applyName({ label, name, source: "手入力" });
+              }),
+            drain: settling.drain,
+            clearSpeaking: relay.clear,
+            stopRelays: Effect.andThen(relay.stop, settling.stop),
+            appendLog: appendRecordedLog,
+            flush: session.flush,
+            // テキストの 3 形式を書けないのは予期しない失敗なので defect にする（HTML の失敗は writeSessionExports の中で警告にする）
+            exports: Effect.flatMap(Effect.all([session.snapshot, Ref.get(names)]), ([snapshot, table]) => writeSessionExports(dir, snapshot, errorMessage, speakerNameMap(table))).pipe(
+              Effect.provideContext(exportServices),
+              Effect.orDie,
+            ),
+          } satisfies SessionSink;
+        }),
+        });
+      }),
+    );
+}

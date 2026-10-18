@@ -1,0 +1,27 @@
+import { Effect } from "effect";
+import { WebSocket } from "ws";
+
+// http のテストが /ws・/ へ張る WebSocket クライアント。受け取ったフレームと close の完了を返し、スコープを閉じると接続を捨てる。
+// send は、ブラウザから届くメッセージを解釈しないことを確かめるテストが使う。
+// pings は、server が送る WebSocket の制御フレーム ping を受け取った回数（ws は自動で pong を返す）。アプリのフレームには数えない。
+// headers は、閲覧の口の Cookie など、Origin 以外に添えるヘッダー。
+// 軽い IT（http.it.test.ts・viewingPort.it.test.ts）と重い IT（http.heavy.test.ts）から使う。
+export const connect = Effect.fnUntraced(function* (port: number, path: string, origin: string | undefined, headers: Record<string, string> = {}) {
+  const ws = yield* Effect.acquireRelease(
+    Effect.sync(() => new WebSocket(`ws://127.0.0.1:${port}${path}`, { headers, ...(origin === undefined ? {} : { origin }) })),
+    (s) => Effect.sync(() => s.terminate()),
+  );
+  const frames: unknown[] = [];
+  const closed = new Promise<void>((resolve) => ws.once("close", resolve));
+  ws.on("message", (data) => frames.push(JSON.parse(String(data))));
+  let pings = 0;
+  ws.on("ping", () => { pings += 1; });
+  yield* Effect.tryPromise(() => new Promise<void>((resolve, reject) => {
+    ws.once("open", resolve);
+    ws.once("error", reject);
+  }));
+  return {
+    frames, closed, send: (data: string | Uint8Array) => ws.send(data), isOpen: () => ws.readyState === WebSocket.OPEN,
+    pings: () => pings, close: () => ws.close(),
+  };
+});

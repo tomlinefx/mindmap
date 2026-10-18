@@ -1,0 +1,292 @@
+import { describe, expect, it } from "@effect/vitest";
+import { Effect } from "effect";
+import { REVIEW_LICENSES_ELEMENT_ID, REVIEW_LOG_ELEMENT_ID, embedReviewLicenses, embedReviewLog, mapOnlyReviewEvents, reviewSnapshot, type Remark } from "../src/core/index.ts";
+import { embeddedText, TEMPLATE } from "./fixtures/review.ts";
+import { playBatches } from "./fixtures/batches.ts";
+
+// 書き出す HTML への埋め込み（ログ・ライセンス）とスナップショットの組み立て。ファイルは使わない
+
+// 埋め込んだ <template> 要素の中身を、ブラウザが textContent で返すのと同じ文字列に戻す（タグの間の文字列を、実体参照を解いて返す）
+function licensesTemplate(html: string): { raw: string; decoded: string } {
+  const match = new RegExp(`<template id="${REVIEW_LICENSES_ELEMENT_ID}">([\\s\\S]*?)</template>`).exec(html);
+  if (!match) throw new Error("ライセンスの要素がありません");
+  const raw = match[1]!;
+  return { raw, decoded: raw.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&") };
+}
+
+const remark = (id: string, text: string, extra: Partial<Remark> = {}): Remark => ({ id, track: "相手", start: 0, end: 5, text, ...extra });
+
+// 発言と差分更新を通した本物のログ（at 付き JSONL 1 行ぶんの形）
+// 1 回目の呼び出しで議題、その呼び出し中に届いた 2 件目を渡す 2 回目の呼び出しでその下（確定した id n1）の論点を足す
+const realisticEvents = Effect.fn("realisticEvents")(function* () {
+  const { session, events } = yield* playBatches(
+    [[remark("r1", "採用の話をします")], [remark("r2", "面接は何回にしますか")]],
+    [
+      [{ op: "add", ref: "t1", parent: "root", kind: "議題", text: "採用", evidence: ["r1"] }],
+      [{ op: "add", ref: "t2", parent: "n1", kind: "論点", text: "面接は何回か", evidence: ["r2"] }],
+    ],
+  );
+  return { session, events: events.map((e, i) => JSON.parse(JSON.stringify({ at: `2026-10-07T00:00:0${i}.000Z`, ...e }))) as unknown[] };
+});
+
+describe("embedReviewLog", () => {
+  it("出来事を <script type=\"application/json\"> に入れる。中身に生の < は 1 つも無く、JSON.parse すると元の出来事に戻る", () => {
+    const events = [
+      { type: "start", title: "</script><script>alert(1)</script>" },
+      { type: "remark", remark: { id: "r1", text: "<!-- <b>&</b> -->" } },
+    ];
+    const html = embedReviewLog(TEMPLATE, events);
+
+    const text = embeddedText(html);
+    expect(text).not.toContain("<");
+    expect(JSON.parse(text)).toEqual(events);
+    // 発言の中の </script> で、要素が早く閉じない
+    expect(html.match(/<script/g)).toHaveLength(1);
+  });
+
+  it("テンプレートの JS の文字列に </body> があっても、最後の本物の </body> の直前に入れ、JS の文字列は変えない", () => {
+    const template = "<html><head><script type=\"module\">const s = \"</body>\";</script></head><body><div id=\"root\"></div></body></html>";
+    const html = embedReviewLog(template, [{ type: "start", title: "t" }]);
+
+    expect(html).toContain("const s = \"</body>\";</script></head>");
+    expect(html.indexOf(`id="${REVIEW_LOG_ELEMENT_ID}"`)).toBeGreaterThan(html.indexOf("<div id=\"root\"></div>"));
+    expect(html.endsWith("</script></body></html>")).toBe(true);
+    expect(html.match(/<\/body>/g)).toHaveLength(2);
+  });
+
+  it("テンプレートに </body> が無ければ throw する", () => {
+    expect(() => embedReviewLog("<html><head></head></html>", [])).toThrow();
+  });
+});
+
+describe("embedReviewLicenses", () => {
+  const LICENSES = "# Licenses\n\n## evil - 1.0.0 (MIT)\n\nPermission --> granted </body> </script> <!-- & &amp; &lt;b&gt; <template></template>\n";
+  const SCRIPT_TEMPLATE = "<html><head><script type=\"module\">const s = \"</body>\";</script></head><body><div id=\"root\"></div></body></html>";
+
+  it("文言を <template> に入れる。中身に生の < > は無く、実体参照を解くと元の文言そのままに戻る", () => {
+    const html = embedReviewLicenses(SCRIPT_TEMPLATE, LICENSES);
+
+    const { raw, decoded } = licensesTemplate(html);
+    expect(raw).not.toMatch(/[<>]/);
+    expect(decoded).toBe(LICENSES);
+    expect(html.match(/<template/g)).toHaveLength(1);
+  });
+
+  it("文言の中の </body>・</script>・--> があっても、HTML の形を壊さず、続けて埋め込むログも最後の本物の </body> の直前に入る", () => {
+    const events = [{ type: "start", title: "t" }];
+    const withLicenses = embedReviewLicenses(SCRIPT_TEMPLATE, LICENSES);
+    const html = embedReviewLog(withLicenses, events);
+
+    expect(JSON.parse(embeddedText(html))).toEqual(events);
+    expect(licensesTemplate(html).decoded).toBe(LICENSES);
+    // 文言の要素はログの要素より前、本物の </body> の前
+    const templateAt = html.indexOf(`<template id="${REVIEW_LICENSES_ELEMENT_ID}">`);
+    expect(templateAt).toBeGreaterThan(html.indexOf("<div id=\"root\"></div>"));
+    expect(html.indexOf(`id="${REVIEW_LOG_ELEMENT_ID}"`)).toBeGreaterThan(html.indexOf("</template>"));
+    // テンプレートの JS の文字列は変わらず、</body> の数も増えない（文言の </body> は実体参照になっている）
+    expect(html).toContain("const s = \"</body>\";</script></head>");
+    expect(html.match(/<\/body>/g)).toHaveLength(2);
+    expect(html.match(/<\/script>/g)).toHaveLength(2);
+    expect(html.endsWith("</script></body></html>")).toBe(true);
+    expect(html).not.toContain("-->");
+  });
+
+  it("テンプレートに </body> が無ければ throw する", () => {
+    expect(() => embedReviewLicenses("<html><head></head></html>", LICENSES)).toThrow();
+  });
+});
+
+describe("reviewSnapshot", () => {
+  // web の入口（main.ts）が同期で呼ぶので、reviewSnapshot は Effect にせず同期の関数のまま保つ
+  it.effect("ログの出来事から、元のセッションの最後の時点と同じマップ・「変わったこと」・根拠を同期で組み立てる", () =>
+    Effect.gen(function* () {
+      const { session, events } = yield* realisticEvents();
+      const snapshot = reviewSnapshot(events);
+
+      expect(snapshot).toEqual(yield* session.snapshot);
+      expect(snapshot.nodes.map((n) => n.text)).toEqual(["定例", "採用", "面接は何回か"]);
+      expect(snapshot.changes.length).toBeGreaterThan(0);
+      expect(snapshot.remarks.map((r) => r.id)).toEqual(["r1", "r2"]);
+    }));
+
+  it.effect("取り込みの記録（知らない type）の行があっても、マップは変わらない", () =>
+    Effect.gen(function* () {
+      const { session, events } = yield* realisticEvents();
+      const withIntake = [...events.slice(0, 2), { at: "2026-10-07T00:00:09.000Z", type: "intake", note: "x" }, ...events.slice(2)];
+
+      expect(reviewSnapshot(withIntake)).toEqual(yield* session.snapshot);
+    }));
+
+  it.effect("diff の行に usage があっても、usage の無い行と同じマップが組み立てられる", () =>
+    Effect.gen(function* () {
+      const { session, events } = yield* realisticEvents();
+      const usage = { input: 10, cacheWrite: 20, cacheRead: 30, output: 40, model: "claude-haiku-5-5" };
+      const withUsage = events.map((e) => ((e as { type: string }).type === "diff" ? { ...(e as object), usage } : e));
+
+      expect(withUsage.some((e) => (e as { usage?: unknown }).usage !== undefined)).toBe(true);
+      expect(reviewSnapshot(withUsage)).toEqual(yield* session.snapshot);
+    }));
+
+  it("壊れたログ（start が無い・項目が壊れた行）では、今と同じく例外を投げる", () => {
+    expect(() => reviewSnapshot([])).toThrow();
+    expect(() => reviewSnapshot([{ type: "start", title: "定例" }, { type: "remark" }])).toThrow();
+  });
+});
+
+// マップだけの版。発言・共有画面の文字は、ノードの text・会議名と部分一致しない値にしてある（not.toContain の判定が意味を持つように）
+const remarkRow = (id: string, track: "自分" | "相手", start: number, end: number, text: string, extra: Record<string, unknown> = {}) => ({
+  at: "2026-10-07T00:00:00.000Z",
+  type: "remark",
+  remark: { id, track, start, end, text },
+  ...extra,
+});
+const addOp = (ref: string, text: string, evidence: string[], parent = "root", kind = "議題") => ({ op: "add", ref, parent, kind, text, evidence });
+const diffRow = (fresh: string[], ops: unknown[], extra: { input?: Record<string, unknown>; error?: string } = {}) => ({
+  at: "2026-10-07T00:00:00.000Z",
+  type: "diff",
+  input: { recent: [], fresh, nodeCount: 0, ...extra.input },
+  ops,
+  dropped: [],
+  ...(extra.error !== undefined ? { error: extra.error } : {}),
+});
+
+const SECRET_TEXT = "給与は九百万です";
+const SECRET_RAW = "きゅうよは九百万です";
+const SECRET_SURFACE = "九百万";
+const SECRET_LINE = "社外秘 売上 12 億";
+const SECRET_VOCAB = "売上見込";
+
+const secretLog = (): unknown[] => [
+  { at: "a", type: "start", title: "定例" },
+  { at: "a", type: "vocab", words: [{ surface: SECRET_VOCAB, romaji: null, source: "screen" }] },
+  { at: "a", type: "screen", start: 3, image: "s1.jpg", lines: [SECRET_LINE] },
+  remarkRow("r1", "相手", 0, 5, SECRET_TEXT, {
+    raw: SECRET_RAW,
+    words: [{ surface: SECRET_SURFACE, romaji: "kyuyo", location: 0, length: 3 }],
+    wordTimes: [{ location: 0, length: 3, start: 0, end: 2 }],
+  }),
+  diffRow(["r1"], [addOp("t1", "採用", ["r1"])], { input: { screenCount: 1 } }),
+];
+
+describe("mapOnlyReviewEvents（発言・共有画面の文字を抜いた出来事）", () => {
+  it("発言の本文・補正前の本文・語、共有画面の OCR の行と語彙の語が、埋め込んだ HTML のどこにも含まれない", () => {
+    const html = embedReviewLog(TEMPLATE, mapOnlyReviewEvents(secretLog()));
+
+    for (const secret of [SECRET_TEXT, SECRET_RAW, SECRET_SURFACE, SECRET_LINE, SECRET_VOCAB]) expect(html).not.toContain(secret);
+  });
+
+  it("発言の行は残し、text は空文字、id・track・start・end だけを持つ。raw・words・wordTimes は持たない", () => {
+    const rows = mapOnlyReviewEvents(secretLog()) as { type: string }[];
+
+    expect(rows.filter((e) => e.type === "remark")).toEqual([{ type: "remark", remark: { id: "r1", track: "相手", start: 0, end: 5, text: "" } }]);
+  });
+
+  it("発言の duplicate・speaker と、行の noContent は残る", () => {
+    const log = [
+      { type: "start", title: "定例" },
+      { type: "remark", remark: { id: "r1", track: "相手", start: 0, end: 5, text: SECRET_TEXT, duplicate: true, speaker: "相手 A" } },
+      { ...remarkRow("r2", "自分", 5, 6, "あ"), noContent: true },
+    ];
+
+    expect(mapOnlyReviewEvents(log)).toEqual([
+      { type: "start", title: "定例" },
+      { type: "remark", remark: { id: "r1", track: "相手", start: 0, end: 5, text: "", duplicate: true, speaker: "相手 A" } },
+      { type: "remark", remark: { id: "r2", track: "自分", start: 5, end: 6, text: "" }, noContent: true },
+    ]);
+  });
+
+  it("共有画面の行は残し、start と image だけを持つ（lines は持たない）", () => {
+    const rows = mapOnlyReviewEvents(secretLog()) as { type: string }[];
+
+    expect(rows.filter((e) => e.type === "screen")).toEqual([{ type: "screen", start: 3, image: "s1.jpg" }]);
+  });
+
+  it("会議名（start の題名）と、マップのノードの文字は残る", () => {
+    const html = embedReviewLog(TEMPLATE, mapOnlyReviewEvents(secretLog()));
+
+    expect(html).toContain("定例");
+    expect(html).toContain("採用");
+  });
+
+  it("復元が読む diff・画面の見送り・一時停止・再開の行はそのまま残り、読まない type の行は残さない", () => {
+    const keep = [
+      { type: "screen-input-skipped", reason: "差分更新には渡さない（モデルが画像を読まない）" },
+      { type: "diff-update-paused", reason: "p" },
+      { type: "diff-update-resumed" },
+    ];
+    const log = [{ type: "start", title: "定例" }, ...keep, { type: "intake", note: "秘密のメモ" }];
+    const out = mapOnlyReviewEvents(log);
+
+    expect(out).toEqual([{ type: "start", title: "定例" }, ...keep]);
+    expect(JSON.stringify(out)).not.toContain("秘密のメモ");
+  });
+
+  it("元の出来事を書き換えない", () => {
+    const log = secretLog();
+    const before = JSON.stringify(log);
+    mapOnlyReviewEvents(log);
+
+    expect(JSON.stringify(log)).toBe(before);
+  });
+
+  it("壊れた発言の行・共有画面の行では、そのまま通さず throw する", () => {
+    expect(() => mapOnlyReviewEvents([{ type: "start", title: "t" }, { type: "remark" }])).toThrow();
+    expect(() => mapOnlyReviewEvents([{ type: "start", title: "t" }, { type: "screen", start: "x", image: null, lines: [SECRET_LINE] }])).toThrow();
+  });
+
+  describe("時刻を動かしたときのマップの組み上がり（接頭部ごとに reviewSnapshot が元のログと同じ）", () => {
+    // 成功・error つきの diff、screenCount つきの diff と screen 行、重複の印、未反映の発言、反映をまたぐ根拠を含む
+    const log = (): unknown[] => [
+      { at: "a", type: "start", title: "定例" },
+      { at: "a", type: "screen", start: 1, image: "s1.jpg", lines: [SECRET_LINE] },
+      remarkRow("r1", "相手", 0, 5, "採用の話をします。"),
+      remarkRow("r2", "自分", 5, 10, "はい。"),
+      diffRow(["r1", "r2"], [addOp("t1", "採用", ["r1"])], { input: { screenCount: 1, screens: [{ start: 1, image: "s1.jpg" }] } }),
+      { at: "b", type: "vocab", words: [{ surface: SECRET_VOCAB, romaji: null, source: "screen" }] },
+      remarkRow("r3", "相手", 12, 20, "予算です。"),
+      { ...remarkRow("r4", "相手", 20, 21, "予算です。"), remark: { id: "r4", track: "相手", start: 20, end: 21, text: "予算です。", duplicate: true } },
+      diffRow(["r3"], [addOp("t2", "予算", ["r3", "r1"])], { error: "失敗" }),
+      remarkRow("r5", "自分", 22, 30, "面接は何回にしますか。", { raw: "めんせつは", words: [{ surface: "面接", romaji: "mensetsu", location: 0, length: 2 }] }),
+      diffRow(["r3", "r5"], [addOp("t3", "面接", ["r5", "r2"], "n1", "論点")]),
+      remarkRow("r6", "相手", 32, 40, "最後の発言。"),
+    ];
+
+    // 発言の本文だけが違う（マップだけの版は空）。それ以外は丸ごと同じ
+    const comparable = (events: readonly unknown[]) => {
+      const s = reviewSnapshot(events);
+      return { ...s, remarks: s.remarks.map(({ text: _text, ...rest }) => rest) };
+    };
+
+    it("すべての接頭部（start だけのものから全体まで）で、nodes・changes・round・currentTopic・now・根拠の発言の id・start・end が同じ", () => {
+      const events = log();
+      for (let n = 1; n <= events.length; n++) {
+        const prefix = events.slice(0, n);
+        expect(comparable(mapOnlyReviewEvents(prefix)), `先頭 ${n} 行`).toEqual(comparable(prefix));
+      }
+    });
+
+    it("全体では、マップが空でなく、変わったことがあり、反映が 2 回数えられている（比べる対象が空ではない）", () => {
+      const s = reviewSnapshot(mapOnlyReviewEvents(log()));
+      expect(s.nodes.map((n) => n.text)).toEqual(["定例", "採用", "予算", "面接"]);
+      expect(s.changes.length).toBeGreaterThan(0);
+      expect(s.round).toBeGreaterThan(1);
+    });
+
+    it("screenCount つきの diff は、screen の行が残るので復元できる（screen の行を落とすと復元に失敗する）", () => {
+      const rows = [
+        { type: "start", title: "定例" },
+        { type: "screen", start: 3, image: "s1.jpg", lines: [SECRET_LINE] },
+        remarkRow("r1", "相手", 0, 5, SECRET_TEXT),
+        diffRow(["r1"], [addOp("t1", "採用", ["r1"])], { input: { screenCount: 1 } }),
+      ];
+
+      expect(reviewSnapshot(mapOnlyReviewEvents(rows)).nodes).toEqual(reviewSnapshot(rows).nodes);
+    });
+
+    it("diff が参照する発言の行は残るので復元できる（発言の行を落とすと「ログに発言がありません」で失敗する）", () => {
+      const rows = [{ type: "start", title: "定例" }, remarkRow("r1", "相手", 0, 5, SECRET_TEXT), diffRow(["r1"], [addOp("t1", "採用", ["r1"])])];
+
+      expect(() => reviewSnapshot(mapOnlyReviewEvents(rows))).not.toThrow();
+    });
+  });
+});

@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    // TS 7 の tsc はこの plugin 欄を読まない。effect-tsgo diagnostics が読む。
+    // effect/process・http・socket・cli は @stability unstable を承知で使う（ADR 0008・0009・0010）ので off。
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "diagnosticSeverity": {
+          "outdatedApi": "error",
+          "unstableApiUsage": "off"
+        }
+      }
+    ]
+  },
+  "include": ["src", "test", "bench", "scripts"]
+}
