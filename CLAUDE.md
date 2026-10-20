@@ -66,6 +66,12 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ---
 
+## Spec-Driven Development
+
+@CC-SDD-CLAUDE.md
+
+---
+
 ## Project: mindmap（live-mindmap の Windows + Android 版）
 
 - 語彙は `CONTEXT.md`、決定は `docs/adr/`。元プロジェクトは `/home/tomline/projects/live-mindmap-main`（MIT）。上流の ADR は `docs/adr/upstream/` に写す
