@@ -1,0 +1,22 @@
+{
+  "feature_name": "map-update-latency",
+  "created_at": "2026-10-20T01:59:58Z",
+  "updated_at": "2026-10-20T23:19:32Z",
+  "language": "ja",
+  "phase": "tasks-generated",
+  "approvals": {
+    "requirements": {
+      "generated": true,
+      "approved": true
+    },
+    "design": {
+      "generated": true,
+      "approved": true
+    },
+    "tasks": {
+      "generated": true,
+      "approved": false
+    }
+  },
+  "ready_for_implementation": false
+}
