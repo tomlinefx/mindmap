@@ -185,6 +185,85 @@ describe("diff の行の judge（判定の記録）", () => {
   }
 });
 
+// 遅れの時刻と、戻した回・1 つだけの回の印。書き手は別のタスクで、ここでは行の形だけを確かめる。
+// 時刻は Unix ms（wallTime と同じ単位）。印は true だけ（noContent と同じ書き方）
+describe("ログの行の遅れの時刻と印", () => {
+  const remarkRow = (extra: Record<string, unknown> = {}) => ({ type: "remark", remark: { id: "r1", track: "相手", start: 0, end: 1, text: "こんにちは" }, ...extra });
+  const diffRow = (extra: Record<string, unknown> = {}) => ({ type: "diff", input: { recent: [], fresh: ["r1"], nodeCount: 0 }, ops: [], dropped: [], ...extra });
+  const decode = (row: unknown) => Schema.decodeUnknownEffect(LogEvent)(row);
+  const WALL = 1760000000000;
+
+  describe("origin の行（壁時計）", () => {
+    it.effect("wallTime は数値のまま残り、at を足した行も decode できる", () =>
+      Effect.gen(function* () {
+        for (const row of [{ type: "origin", wallTime: WALL }, { at: "2026-10-06T00:00:00.000Z", type: "origin", wallTime: WALL }]) {
+          const decoded = yield* decode(row);
+          assert.strictEqual(decoded.type, "origin");
+          assert.strictEqual(decoded.type === "origin" ? decoded.wallTime : undefined, WALL);
+        }
+      }));
+
+    for (const [title, row] of [
+      ["wallTime が文字列", { type: "origin", wallTime: "1760000000000" }],
+      ["wallTime の欠落", { type: "origin" }],
+    ] as const) {
+      it.effect(`${title}の origin の行は decode に失敗する`, () => expectDecodeFailure(decode(row)));
+    }
+  });
+
+  describe("remark の行の settledAt・shownAt", () => {
+    it.effect("両方ある行も、片方だけの行も、値はそのまま残る", () =>
+      Effect.gen(function* () {
+        const both = yield* decode(remarkRow({ settledAt: WALL + 1000, shownAt: WALL + 2000 }));
+        assert.deepStrictEqual(both.type === "remark" ? [both.settledAt, both.shownAt] : undefined, [WALL + 1000, WALL + 2000]);
+        const settledOnly = yield* decode(remarkRow({ settledAt: WALL + 1000 }));
+        assert.deepStrictEqual(settledOnly.type === "remark" ? [settledOnly.settledAt, settledOnly.shownAt] : undefined, [WALL + 1000, undefined]);
+        const shownOnly = yield* decode(remarkRow({ shownAt: WALL + 2000 }));
+        assert.deepStrictEqual(shownOnly.type === "remark" ? [shownOnly.settledAt, shownOnly.shownAt] : undefined, [undefined, WALL + 2000]);
+      }));
+
+    it.effect("どちらも無い古い行は今までどおり decode でき、キーは付かない", () =>
+      Effect.gen(function* () {
+        const decoded = yield* decode(remarkRow());
+        assert.isFalse(decoded.type === "remark" && ("settledAt" in decoded || "shownAt" in decoded));
+      }));
+
+    for (const [title, extra] of [
+      ["settledAt が文字列", { settledAt: "2026-10-06T00:00:00.000Z" }],
+      ["shownAt が文字列", { shownAt: "2026-10-06T00:00:00.000Z" }],
+    ] as const) {
+      it.effect(`${title}の remark の行は decode に失敗する`, () => expectDecodeFailure(decode(remarkRow(extra))));
+    }
+  });
+
+  describe("diff の行の requeued・isolated", () => {
+    it.effect("true の印は残り、error が無くても decode できる", () =>
+      Effect.gen(function* () {
+        const requeued = yield* decode(diffRow({ requeued: true }));
+        assert.deepStrictEqual(requeued.type === "diff" ? [requeued.requeued, requeued.isolated] : undefined, [true, undefined]);
+        const isolated = yield* decode(diffRow({ isolated: true, error: "timeout" }));
+        assert.deepStrictEqual(isolated.type === "diff" ? [isolated.requeued, isolated.isolated] : undefined, [undefined, true]);
+        const both = yield* decode(diffRow({ requeued: true, isolated: true }));
+        assert.deepStrictEqual(both.type === "diff" ? [both.requeued, both.isolated] : undefined, [true, true]);
+      }));
+
+    it.effect("印の無い古い行は今までどおり decode でき、キーは付かない", () =>
+      Effect.gen(function* () {
+        const decoded = yield* decode(diffRow());
+        assert.isFalse(decoded.type === "diff" && ("requeued" in decoded || "isolated" in decoded));
+      }));
+
+    for (const [title, extra] of [
+      ["requeued が false", { requeued: false }],
+      ["requeued が文字列", { requeued: "true" }],
+      ["isolated が false", { isolated: false }],
+      ["isolated が文字列", { isolated: "true" }],
+    ] as const) {
+      it.effect(`${title}の diff の行は decode に失敗する`, () => expectDecodeFailure(decode(diffRow(extra))));
+    }
+  });
+});
+
 describe("diff の行の usage", () => {
   const diff = (usage: unknown) => ({ type: "diff", input: { recent: [], fresh: [], nodeCount: 0 }, ops: [], dropped: [], usage });
   const valid = { input: 10, cacheWrite: 0, cacheRead: 30, output: 40, model: "claude-sonnet-5-5" };

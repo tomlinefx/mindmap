@@ -34,8 +34,16 @@ public static class Events
     public static string Remark(string track, TranscriptionResult result, bool duplicate = false) =>
         Json(new { type = result.IsFinal ? "remark" : "partial", track, start = result.Start, end = result.End, text = result.Text, duplicate, words = Array.Empty<object>(), wordTimes = result.WordTimes ?? [] });
 
-    /// <summary>2 トラック共通の時刻の原点。64 bit の値は JSON の number では桁が落ちるので、数字だけの文字列にする。</summary>
-    public static string Origin(long hostTime) => Json(new { type = "origin", hostTime = hostTime.ToString(System.Globalization.CultureInfo.InvariantCulture) });
+    /// <summary>VAD が区間を閉じた。その区間の確定結果より先に送る。本文は持たない。start は確定結果と同じ揃え方。</summary>
+    public static string SegmentEnd(string track, double start, double end) =>
+        Json(new { type = "segment-end", track, start, end });
+
+    /// <summary>2 トラック共通の時刻の原点。64 bit の値は JSON の number では桁が落ちるので、数字だけの文字列にする。wallTime は原点（音声の時刻 0）に当たる壁時計の Unix ms で、ms なら number で足りる。</summary>
+    public static string Origin(long hostTime, long wallTime) =>
+        Json(new { type = "origin", hostTime = hostTime.ToString(System.Globalization.CultureInfo.InvariantCulture), wallTime });
+
+    /// <summary>話者分離を使えない。話者分離のモデルを持たない初版は、起動直後（origin の次）に 1 回だけ送る。</summary>
+    public static string SpeakerOff(double start) => Json(new { type = "speaker-off", start, reason = "モデルなし" });
 
     /// <summary>自分の休止の状態が変わった。初版の理由は手動だけ。</summary>
     public static string SelfPause(bool paused, double start) =>

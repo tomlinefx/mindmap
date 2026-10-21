@@ -189,6 +189,25 @@ describe("decodeHelperEvent（ヘルパーのイベント文字列 → 知って
       ["hostTime の欠落", { type: "origin" }],
     ])("必須項目が壊れていたら、読み飛ばさずにタグ付きの失敗になる（%s）", (_name, data) =>
       expectDecodeFailure(decodeHelperEvent(JSON.stringify(data))));
+
+    // 音声の時刻 0 に当たる壁時計（Unix ms）。省ける項目で、無い旧ヘルパーの origin は上のテストのとおり読める
+    it.effect("wallTime つきの origin は hostTime と wallTime を保って decode される", () =>
+      Effect.gen(function* () {
+        const event = { type: "origin", hostTime: "9007199254740993", wallTime: 1760000000000 } as const;
+        const decoded = yield* expectDecodeSuccess(decodeHelperEvent(JSON.stringify(event)));
+        assert.deepStrictEqual(decoded, { kind: "known", event });
+      }));
+
+    it.effect.each([
+      ["wallTime が文字列", { type: "origin", hostTime: "1", wallTime: "1760000000000" }],
+      ["wallTime が null", { type: "origin", hostTime: "1", wallTime: null }],
+    ])("壊れた wallTime は、読み飛ばさずに SchemaError で失敗する（%s）", (row) =>
+      Effect.gen(function* () {
+        const [, data] = row;
+        const result = yield* Effect.result(decodeHelperEvent(JSON.stringify(data)));
+        if (Result.isSuccess(result)) return assert.fail("decode が成功してしまった（壊れた wallTime のはずが通った）");
+        assert.strictEqual(result.failure._tag, "SchemaError");
+      }));
   });
 
   // 共有画面の変化（Issue #278）。image は JPEG の base64。decode でバイト列にし、ウィンドウが無くなったら null。
@@ -397,6 +416,31 @@ describe("decodeHelperEvent（ヘルパーのイベント文字列 → 知って
         const [, data] = row;
         const result = yield* Effect.result(decodeHelperEvent(JSON.stringify(data)));
         if (Result.isSuccess(result)) return assert.fail("decode が成功してしまった（壊れた speaker-off のはずが通った）");
+        assert.strictEqual(result.failure._tag, "SchemaError");
+      }));
+  });
+
+  // VAD が区間を閉じた知らせ。本文は持たず、track・start・end（origin と同じ原点からの秒）だけを運ぶ
+  describe("segment-end（区間の区切り）", () => {
+    it.effect.each(["自分", "相手"] as const)("track が %s の正しい形は known として decode され、track・start・end を保つ", (track) =>
+      Effect.gen(function* () {
+        const event = { type: "segment-end", track, start: 1.5, end: 3.25 } as const;
+        const decoded = yield* expectDecodeSuccess(decodeHelperEvent(JSON.stringify(event)));
+        assert.deepStrictEqual(decoded, { kind: "known", event });
+      }));
+
+    it.effect.each([
+      ["track が不正", { type: "segment-end", track: "司会", start: 0, end: 1 }],
+      ["track のキーが無い", { type: "segment-end", start: 0, end: 1 }],
+      ["start のキーが無い", { type: "segment-end", track: "相手", end: 1 }],
+      ["start が文字列", { type: "segment-end", track: "相手", start: "0", end: 1 }],
+      ["end のキーが無い", { type: "segment-end", track: "相手", start: 0 }],
+      ["end が文字列", { type: "segment-end", track: "相手", start: 0, end: "1" }],
+    ])("壊れた segment-end は、読み飛ばさずに SchemaError で失敗する（%s）", (row) =>
+      Effect.gen(function* () {
+        const [, data] = row;
+        const result = yield* Effect.result(decodeHelperEvent(JSON.stringify(data)));
+        if (Result.isSuccess(result)) return assert.fail("decode が成功してしまった（壊れた segment-end のはずが通った）");
         assert.strictEqual(result.failure._tag, "SchemaError");
       }));
   });

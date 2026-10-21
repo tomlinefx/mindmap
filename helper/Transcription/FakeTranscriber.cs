@@ -13,6 +13,7 @@ public sealed class FakeTranscriber : ITranscriber
 
     public string Label { get; set; } = "fake";
     public event Action<TranscriptionResult>? OnResult;
+    public event Action<SegmentEnd>? OnSegmentEnd;
 
     private double? segmentStart;
     private double lastVoice;
@@ -49,6 +50,7 @@ public sealed class FakeTranscriber : ITranscriber
     {
         var start = segmentStart!.Value;
         segmentStart = null;
+        OnSegmentEnd?.Invoke(new SegmentEnd(start, end));
         OnResult?.Invoke(new TranscriptionResult(Text(start, end), true, start, end));
     }
 

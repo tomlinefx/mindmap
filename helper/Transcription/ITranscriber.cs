@@ -11,9 +11,15 @@ public interface ITranscriber : IDisposable
 
     event Action<TranscriptionResult>? OnResult;
 
+    /// <summary>VAD が区間を閉じた。その区間の確定結果（OnResult）より先に、デコードを待たずに呼ばれる。確定結果が空の区間でも呼ばれる。</summary>
+    event Action<SegmentEnd>? OnSegmentEnd;
+
     /// <summary>samples はその区間の音、endSeconds はその区間の終わりのトラック内時刻。</summary>
     void Push(float[] samples, double endSeconds);
 
     /// <summary>取得の終わり。溜めている分を確定して返す。</summary>
     void Finish();
 }
+
+/// <summary>区間の終わり。Start は同じ区間の確定結果の Start と同じ揃え方、End は区間の終わり。どちらもトラック内の秒。</summary>
+public sealed record SegmentEnd(double Start, double End);

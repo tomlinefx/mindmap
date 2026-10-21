@@ -6,7 +6,7 @@ namespace Mindmap.Helper;
 
 /// <summary>
 /// `run`: 2 トラック（自分 = マイク、相手 = 会議アプリ）を取り、文字にして WebSocket で server へ流す。
-/// 時刻の原点は、最初の起動で `origin` として送り、起動し直し（--origin）では server から受け取った値を使う。
+/// 時刻の原点は、最初の起動では自分で決め、起動し直し（--origin）では server から受け取った値を使う。どちらも起動直後に `origin`（壁時計つき）と `speaker-off` をこの順で送る。
 /// </summary>
 public sealed class RunSession
 {
@@ -16,7 +16,6 @@ public sealed class RunSession
     private readonly int port;
     private readonly string app;
     private readonly long origin; // Stopwatch.GetTimestamp() の値。秒 = (now - origin) / Frequency
-    private readonly bool firstLaunch;
     private readonly string manual; // none | pause | take
     private readonly Func<ITranscriber> newTranscriber;
 
@@ -24,7 +23,6 @@ public sealed class RunSession
     {
         this.port = port;
         this.app = app;
-        firstLaunch = originArg is null;
         origin = originArg is null ? Stopwatch.GetTimestamp() : long.Parse(originArg, System.Globalization.CultureInfo.InvariantCulture);
         manual = selfManual ?? "none";
         this.newTranscriber = newTranscriber;
@@ -65,7 +63,10 @@ public sealed class RunSession
         await using (socket)
         {
             socket.Start();
-            if (firstLaunch) socket.Send(Events.Origin(origin));
+            // origin → speaker-off の順で、音声を取る前に積む（以後の結果より先に届く）。起動し直しでも、受けた原点に当たる壁時計を添える
+            var elapsed = Now;
+            socket.Send(Events.Origin(origin, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - (long)(elapsed * 1000)));
+            socket.Send(Events.SpeakerOff(0));
 
             try
             {
@@ -133,6 +134,7 @@ public sealed class RunSession
             End = trackStart + result.End,
             WordTimes = result.WordTimes?.Select(w => w with { start = trackStart + w.start, end = trackStart + w.end }).ToList(),
         }));
+        stt.OnSegmentEnd += segment => socket.Send(Events.SegmentEnd(track, trackStart + segment.Start, trackStart + segment.End));
         if (echo is null) capture.OnSamples += stt.Push;
         else
         {

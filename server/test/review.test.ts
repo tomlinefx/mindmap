@@ -127,6 +127,24 @@ describe("reviewSnapshot", () => {
       expect(reviewSnapshot(withUsage)).toEqual(yield* session.snapshot);
     }));
 
+  it.effect("origin の行と、remark の settledAt・shownAt、diff の requeued・isolated があっても、無い古いログと同じマップが組み立てられる", () =>
+    Effect.gen(function* () {
+      const { session, events } = yield* realisticEvents();
+      const marked = [
+        { at: "2026-10-07T00:00:00.000Z", type: "origin", wallTime: 1760000000000 },
+        ...events.map((e) => {
+          const type = (e as { type: string }).type;
+          if (type === "remark") return { ...(e as object), settledAt: 1760000001000, shownAt: 1760000002000 };
+          if (type === "diff") return { ...(e as object), requeued: true, isolated: true };
+          return e;
+        }),
+      ];
+
+      expect(marked.some((e) => (e as { shownAt?: unknown }).shownAt !== undefined)).toBe(true);
+      expect(marked.some((e) => (e as { isolated?: unknown }).isolated !== undefined)).toBe(true);
+      expect(reviewSnapshot(marked)).toEqual(yield* session.snapshot);
+    }));
+
   it("壊れたログ（start が無い・項目が壊れた行）では、今と同じく例外を投げる", () => {
     expect(() => reviewSnapshot([])).toThrow();
     expect(() => reviewSnapshot([{ type: "start", title: "定例" }, { type: "remark" }])).toThrow();
@@ -219,6 +237,23 @@ describe("mapOnlyReviewEvents（発言・共有画面の文字を抜いた出来
 
     expect(out).toEqual([{ type: "start", title: "定例" }, ...keep]);
     expect(JSON.stringify(out)).not.toContain("秘密のメモ");
+  });
+
+  it("遅れの時刻と印を持つ行は、origin の行と remark の settledAt・shownAt を残さず、diff の印は diff の行ごとそのまま残る", () => {
+    const log = [
+      { type: "start", title: "定例" },
+      { type: "origin", wallTime: 1760000000000 },
+      remarkRow("r1", "相手", 0, 5, SECRET_TEXT, { settledAt: 1760000001000, shownAt: 1760000002000 }),
+      { ...diffRow(["r1"], [addOp("t1", "採用", ["r1"])]), requeued: true, isolated: true },
+    ];
+    const out = mapOnlyReviewEvents(log) as { type: string }[];
+
+    expect(out.map((e) => e.type)).toEqual(["start", "remark", "diff"]);
+    expect(out[1]).toEqual({ type: "remark", remark: { id: "r1", track: "相手", start: 0, end: 5, text: "" } });
+    expect(out[2]).toMatchObject({ requeued: true, isolated: true });
+    expect(JSON.stringify(out)).not.toContain("settledAt");
+    expect(JSON.stringify(out)).not.toContain("shownAt");
+    expect(JSON.stringify(out)).not.toContain("wallTime");
   });
 
   it("元の出来事を書き換えない", () => {

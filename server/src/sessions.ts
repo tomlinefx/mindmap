@@ -217,6 +217,9 @@ export class Sessions extends Context.Service<Sessions, {
           case "file-audio-tracks":
             // 共有画面と録画の文字起こしは初版では無い。イベントの形は上流のまま保ち、届いても何もしない
             return Effect.void;
+          case "segment-end":
+            // 取り込み待ちの仮の表示に使うまでは、届いても何もしない
+            return Effect.void;
           case "speaker":
           case "speaker-off":
           case "speaker-settled":

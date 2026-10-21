@@ -4,7 +4,8 @@ using Mindmap.Helper.Transcription;
 // 引数の解釈と配線だけ。使い方は helper/README.md
 //   mindmap-helper list
 //   mindmap-helper check
-//   mindmap-helper run --app <id> --port <n> [--origin <hostTime>] [--self-manual pause|take]
+//   mindmap-helper run --app <id> --port <n> [--origin <hostTime>] [--self-manual pause|take] [--vad-silence <秒>]
+//   mindmap-helper stt-file <wav> [--vad-silence <秒>]
 static string? Option(string[] args, string name)
 {
     var index = Array.IndexOf(args, name);
@@ -38,9 +39,10 @@ switch (command)
             Console.Error.WriteLine("--self-manual は pause か take");
             return 2;
         }
+        if (!TryVadSilence(args, out var minSilence)) return 2;
         using var cancel = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cancel.Cancel(); };
-        var newTranscriber = Transcriber();
+        var newTranscriber = Transcriber(minSilence);
         if (newTranscriber is null) return 1;
         var session = new RunSession(portNumber, app, Option(args, "--origin"), selfManual, newTranscriber);
         return await session.Run(cancel.Token);
@@ -50,7 +52,8 @@ switch (command)
         // 開発用: 16 kHz 以外でもよい wav を 1 本、端末内 STT に通して結果を標準出力に出す（モデルの確認用）
         var path = args.Length > 1 ? args[1] : null;
         if (path is null) { Console.Error.WriteLine("stt-file には wav のパスが要ります"); return 2; }
-        var newTranscriber = Transcriber();
+        if (!TryVadSilence(args, out var minSilence)) return 2;
+        var newTranscriber = Transcriber(minSilence);
         if (newTranscriber is null) return 1;
         return SttFile.Run(path, newTranscriber);
     }
@@ -66,7 +69,7 @@ switch (command)
 }
 
 // 端末内 STT（sherpa-onnx）。MINDMAP_STT=fake なら偽の STT（音声のパイプラインの確認用）。モデルが無ければ null（理由は標準エラーに出す）
-static Func<ITranscriber>? Transcriber()
+static Func<ITranscriber>? Transcriber(float minSilence)
 {
     if (Environment.GetEnvironmentVariable("MINDMAP_STT") == "fake") return () => new FakeTranscriber();
     var files = ModelFiles.Find(Check.ModelDirectory);
@@ -75,5 +78,20 @@ static Func<ITranscriber>? Transcriber()
         Console.Error.WriteLine($"端末内 STT のモデルがありません: {Check.ModelDirectory}（scripts/win-stt-models.cmd で入れる）");
         return null;
     }
-    return () => new SherpaTranscriber(files);
+    return () => new SherpaTranscriber(files, minSilence: minSilence);
+}
+
+// --vad-silence <秒>: VAD が区間を閉じる無音の長さ。省略なら 0.6。正の数でなければ理由を標準エラーに出して false
+static bool TryVadSilence(string[] args, out float minSilence)
+{
+    minSilence = 0.6f;
+    if (Array.IndexOf(args, "--vad-silence") < 0) return true;
+    var value = Option(args, "--vad-silence");
+    if (value is not null && float.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var seconds) && float.IsFinite(seconds) && seconds > 0)
+    {
+        minSilence = seconds;
+        return true;
+    }
+    Console.Error.WriteLine("--vad-silence は 0 より大きい秒数");
+    return false;
 }

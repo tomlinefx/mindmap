@@ -81,7 +81,9 @@ export const RemarkEvent = Schema.Struct({ type: Schema.Literal("remark"), remar
   // 補正した発言では remark.text（直した本文）と異なる。words は raw の位置のまま（直した本文には合わせない）
   raw: Schema.optionalKey(Schema.String), words: Schema.optionalKey(Schema.Array(Word)),
   // STT の run ごとの区間（Issue #1019）。受け取った発言の行にだけ付く（古いログには無い）。位置は関所を通った後の本文（raw）のまま、秒は会議の原点から
-  wordTimes: Schema.optionalKey(Schema.Array(WordTime)) });
+  wordTimes: Schema.optionalKey(Schema.Array(WordTime)),
+  // 発言が締まった時刻と、取り込み待ちに出した時刻（どちらも Unix ms）。書き手が残した行にだけ付く（古いログには無い）
+  settledAt: Schema.optionalKey(Schema.Finite), shownAt: Schema.optionalKey(Schema.Finite) });
 // ログの中の共有画面の参照。image は screens/ のファイル名、null は何も映らない
 const ScreenRef = Schema.Struct({ start: Schema.Finite, image: Schema.NullOr(Schema.String) });
 // lines は受け取った OCR の行（Issue #643）。受け取らなかった画面と古いログには付かない
@@ -107,6 +109,8 @@ export const DiffEvent = Schema.Struct({
   dropped: Schema.mutable(Schema.Array(Dropped)),
   error: Schema.optionalKey(Schema.String),
   processedRemarks: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+  requeued: Schema.optionalKey(Schema.Literal(true)), // 取り込み待ちへ戻した回の印。戻した回にだけ付く（古いログには無い）
+  isolated: Schema.optionalKey(Schema.Literal(true)), // 発言を 1 つだけ渡した回の印。1 つだけにした回にだけ付く（古いログには無い）
   usage: Schema.optionalKey(DiffUsage), // この呼び出しのトークン数。数えられない実装・失敗した呼び出しには付かない
   judge: Schema.optionalKey(JudgeRecord), // 振り分けの判定の記録。判定を使わない実装・判定を呼ばなかった回には付かない
   // update を呼ぶ直前と、応答（または失敗）を受けた直後の実時刻（at と同じ書き方）。update に入らなかった回（添える画像の読み戻しの失敗）には付かない
@@ -124,7 +128,9 @@ export const VocabEvent = Schema.Struct({
 // このセッションの番号（Issue #645）。溜まりが開始時に数えた値で、終了時と cli restore が溜まりを更新するときの語の「最後に話されたセッション」になる。
 // 溜まりを使わなかったセッション（play・古いログ・溜まりが読めなかった回）には付かない
 export const VocabPoolEvent = Schema.Struct({ type: Schema.Literal("vocab-pool"), session: Schema.Int });
-export const LogEvent = Schema.Union([StartEvent, RemarkEvent, VocabEvent, VocabPoolEvent, ScreenEvent, ScreenOffEvent, ScreenInputSkippedEvent, DiffEvent, DiffUpdatePausedEvent, DiffUpdateRetryEvent, DiffUpdateResumedEvent, DiffUpdateStateEvent]);
+// 音声の時刻 0 に当たる壁時計（Unix ms）。遅れの時刻を出すときの起点
+export const OriginEvent = Schema.Struct({ type: Schema.Literal("origin"), wallTime: Schema.Finite });
+export const LogEvent = Schema.Union([StartEvent, OriginEvent, RemarkEvent, VocabEvent, VocabPoolEvent, ScreenEvent, ScreenOffEvent, ScreenInputSkippedEvent, DiffEvent, DiffUpdatePausedEvent, DiffUpdateRetryEvent, DiffUpdateResumedEvent, DiffUpdateStateEvent]);
 export type LogEvent = typeof LogEvent["Type"];
 
 // ログを書く役。core から見て失敗しない（書けないときは書き手が defect にする）。

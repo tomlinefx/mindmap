@@ -204,6 +204,37 @@ describe("ログからの復元", () => {
       expect(JSON.stringify(yield* restoredTimes.exportJson)).not.toContain("wordTimes");
     }));
 
+  // 遅れの時刻と印・origin の行を持たない古いログと、持つ新しいログの、どちらも同じマップ・書き出し・未反映の発言に復元される
+  // （requeued を読む復元は別のタスク。ここでは今の復元が新しい項目を無視して壊れないことだけを見る）
+  it.effect("settledAt・shownAt・requeued・isolated・origin の行を含むログも、含まない古いログと同じ状態に復元される", () =>
+    Effect.gen(function* () {
+      const { events } = yield* original();
+      const plain = viaJsonl(events);
+      const WALL = 1760000000000;
+      const marked = [
+        { at: "2026-10-01T00:00:00.000Z", type: "origin", wallTime: WALL },
+        ...plain.map((line) => {
+          const e = line as { type?: string };
+          if (e.type === "remark") return { ...e, settledAt: WALL + 1000, shownAt: WALL + 2000 };
+          if (e.type === "diff") return { ...e, isolated: true };
+          return line;
+        }),
+      ];
+      expect(marked.some((line) => "settledAt" in (line as object))).toBe(true);
+      expect(marked.some((line) => "isolated" in (line as object))).toBe(true);
+      // error の無い diff にも requeued を付けて、印があっても反映済みとして読むことを見る
+      const failedDiff = marked.findIndex((line) => (line as { error?: string }).error !== undefined);
+      expect(failedDiff).toBeGreaterThan(0);
+      marked[failedDiff] = { ...(marked[failedDiff] as object), requeued: true };
+
+      const restoredPlain = yield* restore(plain);
+      const restoredMarked = yield* restore(marked);
+      expect(yield* restoredMarked.snapshot).toEqual(yield* restoredPlain.snapshot);
+      expect(yield* restoredMarked.exportJson).toEqual(yield* restoredPlain.exportJson);
+      expect(yield* restoredMarked.unreflectedRemarks).toEqual(yield* restoredPlain.unreflectedRemarks);
+      expect(JSON.stringify(yield* restoredMarked.exportJson)).not.toContain("settledAt");
+    }));
+
   it.effect("復元の間は差分更新を呼ばず、イベントを SessionLog に書き直さない", () =>
     Effect.gen(function* () {
       const { events } = yield* original();

@@ -24,7 +24,9 @@ const helperRemarkFields = {
 export const HelperEvent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("remark"), ...helperRemarkFields }),
   Schema.Struct({ type: Schema.Literal("partial"), ...helperRemarkFields }),
-  Schema.Struct({ type: Schema.Literal("origin"), hostTime: Schema.String.check(Schema.isPattern(/^\d+$/)) }),
+  Schema.Struct({ type: Schema.Literal("origin"), hostTime: Schema.String.check(Schema.isPattern(/^\d+$/)),
+    // 音声の時刻 0 に当たる壁時計（Unix ms）。無い旧ヘルパーのイベントも受け付ける
+    wallTime: Schema.optionalKey(Schema.Finite) }),
   // 共有画面の変化。image は JPEG の base64（バイト列に戻す。base64 として不正なら SchemaError）で、ウィンドウが無くなったときは null
   Schema.Struct({ type: Schema.Literal("screen"), start: Schema.Finite, image: Schema.NullOr(Schema.Uint8ArrayFromBase64),
     // Vision で読んだ文字の行（Issue #643）。無い旧ヘルパーのイベントも受け付ける
@@ -54,6 +56,8 @@ export const HelperEvent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("file-audio-tracks"), count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)) }),
   // 話者分離を使えない（モデルが無い・読み込みに失敗・途中で停止）。認識は続く。start は origin と同じ原点からの秒
   Schema.Struct({ type: Schema.Literal("speaker-off"), start: Schema.Finite, reason: Schema.Literals(["モデルなし", "読み込みに失敗", "途中で停止"]) }),
+  // VAD が区間を閉じた。その区間の確定結果より先に届き、本文は持たない。start は確定結果と同じ揃え方で、start / end は origin と同じ原点からの秒
+  Schema.Struct({ type: Schema.Literal("segment-end"), track: Track, start: Schema.Finite, end: Schema.Finite }),
   // 相手の話者分離が、ここまで確定した（Issue #1021）。to より前の確定した区間（speaker の final: true）はすべて届いている。origin と同じ原点からの秒。「揃った」の判定はこの位置だけで行う
   Schema.Struct({ type: Schema.Literal("speaker-settled"), track: Track, to: Schema.Finite }),
   // 相手の話者の枠 slot に、別の声が混ざっている（Issue #1024。Sortformer の枠は 4 つまでで、5 人目以降が声の近い人の枠に混ざる）。

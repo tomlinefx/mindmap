@@ -4,7 +4,7 @@ using NAudio.Wave;
 
 namespace Mindmap.Helper;
 
-/// <summary>開発用 `stt-file`: wav を 16 kHz モノラルにして STT に通し、途中結果と確定結果を順に標準出力へ出す。</summary>
+/// <summary>開発用 `stt-file`: wav を 16 kHz モノラルにして STT に通し、途中結果・区切り・確定結果を、run と同じ形の JSON のイベントとして 1 行ずつ標準出力へ出す。</summary>
 public static class SttFile
 {
     public static int Run(string path, Func<ITranscriber> newTranscriber)
@@ -13,7 +13,8 @@ public static class SttFile
         var resampler = new Resampler(reader.WaveFormat, Capture.TargetRate);
         using var stt = newTranscriber();
         var started = DateTime.UtcNow;
-        stt.OnResult += result => Console.WriteLine($"{(result.IsFinal ? "remark " : "partial")} [{result.Start,7:0.00}-{result.End,7:0.00}] {result.Text}");
+        stt.OnResult += result => Console.WriteLine(Events.Remark(Track.Self, result));
+        stt.OnSegmentEnd += segment => Console.WriteLine(Events.SegmentEnd(Track.Self, segment.Start, segment.End));
         var buffer = new byte[reader.WaveFormat.AverageBytesPerSecond / 10];
         long samples = 0;
         int read;

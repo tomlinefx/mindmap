@@ -21,14 +21,17 @@ public sealed class SherpaTranscriber : ITranscriber
     private const double PreRoll = 0.4; // VAD が話し始めと判定するより前の音声を、デコードする区間の頭に足す（頭の子音を落とさない）
     private const int HistorySeconds = 20;
     private const float MaxSpeech = 12f; // VAD が区間を強制的に閉じる長さ（秒）。発言は 1 文のつもり。長いほど途中結果のデコードし直しが重い
+    private const double PartialBacklogLimit = 0.3; // 待ち行列にこれより長い音声がたまっている間は、途中結果のデコードを飛ばす（確定結果は飛ばさない）
 
     public event Action<TranscriptionResult>? OnResult;
+    public event Action<SegmentEnd>? OnSegmentEnd;
 
     private readonly OfflineRecognizer recognizer;
     private readonly VoiceActivityDetector vad;
     private readonly Channel<float[]?> queue = Channel.CreateUnbounded<float[]?>();
     private readonly string? dump = Environment.GetEnvironmentVariable("MINDMAP_STT_DUMP"); // 開発用: デコードした区間の音声を wav で残すフォルダ
     private int dumped;
+    private long queuedSamples; // Push したが作業スレッドがまだ取り出していない音声のサンプル数（取得のスレッドと作業スレッドから触る）
     private readonly Task worker;
 
     private readonly List<float> pending = []; // VAD の窓に満たない端数
@@ -44,7 +47,7 @@ public sealed class SherpaTranscriber : ITranscriber
     public string Label { get => label; set => label = value; }
     private string label;
 
-    public SherpaTranscriber(ModelFiles files, string label = "stt", int threads = 4)
+    public SherpaTranscriber(ModelFiles files, string label = "stt", int threads = 4, float minSilence = 0.6f)
     {
         this.label = label;
         var config = new OfflineRecognizerConfig();
@@ -59,7 +62,7 @@ public sealed class SherpaTranscriber : ITranscriber
         var vadConfig = new VadModelConfig();
         vadConfig.SileroVad.Model = files.Vad;
         vadConfig.SileroVad.Threshold = 0.3f; // 再生デバイス経由の小さい音でも話し始めを落とさない
-        vadConfig.SileroVad.MinSilenceDuration = 0.6f;
+        vadConfig.SileroVad.MinSilenceDuration = minSilence; // 区間を閉じる無音の長さ（秒）。既定 0.6
         vadConfig.SileroVad.MinSpeechDuration = 0.25f;
         vadConfig.SileroVad.MaxSpeechDuration = MaxSpeech;
         vadConfig.SileroVad.WindowSize = Window;
@@ -68,7 +71,11 @@ public sealed class SherpaTranscriber : ITranscriber
         worker = Task.Run(Work);
     }
 
-    public void Push(float[] samples, double endSeconds) => queue.Writer.TryWrite(samples);
+    public void Push(float[] samples, double endSeconds)
+    {
+        Interlocked.Add(ref queuedSamples, samples.Length);
+        queue.Writer.TryWrite(samples);
+    }
 
     public void Finish()
     {
@@ -87,6 +94,7 @@ public sealed class SherpaTranscriber : ITranscriber
                 Drain();
                 return;
             }
+            Interlocked.Add(ref queuedSamples, -samples.Length); // 取り出したので待ち行列のぶんから外す
             pending.AddRange(samples);
             while (pending.Count >= Window)
             {
@@ -139,6 +147,8 @@ public sealed class SherpaTranscriber : ITranscriber
         }
         var start = (double)speechStart / SampleRate;
         if (Now - lastPartial < PartialEvery || Now - start < MinPartial) return;
+        // デコードが追いつかず音声がたまっているときは、途中結果を飛ばして確定結果に回す（lastPartial は更新しない）
+        if (Volatile.Read(ref queuedSamples) > PartialBacklogLimit * SampleRate) return;
         lastPartial = Now;
         var result = Decode(Slice(speechStart, fed), start);
         if (result is null) return;
@@ -157,10 +167,12 @@ public sealed class SherpaTranscriber : ITranscriber
             // 区間の頭に先行音声を足す（history に残っているぶんだけ）
             var preRoll = Slice(segment.Start - (long)(PreRoll * SampleRate), segment.Start);
             var start = (double)(segment.Start - preRoll.Length) / SampleRate;
-            var result = Decode([.. preRoll, .. segment.Samples], start);
             // 途中結果を出した区間なら、その start に揃える（server が同じ発話として確定結果で置き換えられるように）
             var aligned = partialStart is { } ps && Math.Abs(ps - start) < 1.0 ? ps : start;
             partialStart = null;
+            // 区切りは確定のデコードより先に知らせる（デコードが空でも出す）。end は先行音声を含まない区間の終わり
+            OnSegmentEnd?.Invoke(new SegmentEnd(aligned, (double)(segment.Start + segment.Samples.Length) / SampleRate));
+            var result = Decode([.. preRoll, .. segment.Samples], start);
             if (result is not null) OnResult?.Invoke(result with { IsFinal = true, Start = aligned, WordTimes = result.WordTimes?.Select(w => w with { start = w.start - start + aligned, end = w.end - start + aligned }).ToList() });
         }
     }
