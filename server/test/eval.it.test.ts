@@ -13,9 +13,9 @@ import { type DiffInput, type DiffUsage, type Op, Truth } from "../src/core/inde
 import { fakeListener } from "./fakeListener.ts";
 
 // play の updater と配信を差し替える。評価の対象は保存されたマップなので、配信は偽物でよい
-const external = vi.hoisted(() => ({ openClaudeUpdater: vi.fn(), openListener: vi.fn() }));
+const external = vi.hoisted(() => ({ openClaudeUpdater: vi.fn(), openListener: vi.fn(), layerClaude: vi.fn() }));
 vi.mock("../src/claude.ts", async (importOriginal) => ({
-  ...(await import("./fixtures/claudeModule.ts")).fakeClaudeModule(() => external.openClaudeUpdater()),
+  ...(await import("./fixtures/claudeModule.ts")).fakeClaudeModule(() => external.openClaudeUpdater(), (model, tuning) => external.layerClaude(model, tuning)),
   AgentSdk: (await importOriginal<typeof import("../src/claude.ts")>()).AgentSdk,
 }));
 // 配信の待受け（openListener）だけを偽物にする。serveFeed・portOf は本物のまま
@@ -27,6 +27,7 @@ vi.mock("../src/http.ts", async (importOriginal) => ({
 beforeEach(() => {
   external.openClaudeUpdater.mockReset();
   external.openListener.mockReset();
+  external.layerClaude.mockReset();
   external.openListener.mockImplementation(fakeListener().open);
 });
 
@@ -571,6 +572,60 @@ describe("eval: 正解ファイルの検証", () => {
     const failure = yield* evalFailure(["--truth", path, dir]);
     expect(failure.tag).toBe("InvalidTruthFile");
     expect(carries(failure.values, "「TODO」の 2 件目")).toBe(true);
+  }));
+});
+
+describe("eval: 差分更新の調整（effort・thinking）の上書き（タスク 8.1）", () => {
+  // 元のランを作ってから、その play が layer に渡した記録と updater の取得回数を空にする
+  const sourceRun = Effect.gen(function* () {
+    const dir = yield* play(scriptA);
+    external.layerClaude.mockClear();
+    external.openClaudeUpdater.mockClear();
+    return dir;
+  });
+
+  it.effect("引数なしは保存済みの結果を集計するだけで、差分更新の layer を作らない", () => Effect.gen(function* () {
+    yield* evalCli([yield* sourceRun]);
+
+    expect(external.layerClaude).not.toHaveBeenCalled();
+    expect(external.openClaudeUpdater).not.toHaveBeenCalled();
+  }));
+
+  it.effect("--effort と --thinking を渡すと、--model なしでも元ログを既定のモデルと上書きした調整で流し直す", () => Effect.gen(function* () {
+    const stdout = yield* evalCli(["--effort", "high", "--thinking", "off", yield* sourceRun]);
+
+    expect(external.layerClaude.mock.calls).toEqual([["claude-sonnet-5-5", { effort: "high", thinking: "off" }]]);
+    expect(external.openClaudeUpdater).toHaveBeenCalledTimes(1);
+    expect(parseTable(stdout).rows).toHaveLength(1);
+  }));
+
+  it.effect("--effort だけなら、thinking は表の値のまま", () => Effect.gen(function* () {
+    yield* evalCli(["--effort", "low", yield* sourceRun]);
+
+    expect(external.layerClaude.mock.calls).toEqual([["claude-sonnet-5-5", { effort: "low", thinking: "adaptive" }]]);
+  }));
+
+  it.effect("--model と --effort を渡すと、そのモデルの表の thinking に effort だけを上書きする", () => Effect.gen(function* () {
+    yield* evalCli(["--model", "claude-haiku-5-5", "--effort", "medium", yield* sourceRun]);
+
+    expect(external.layerClaude.mock.calls).toEqual([["claude-haiku-5-5", { effort: "medium", thinking: "adaptive" }]]);
+  }));
+
+  it.effect("渡せない組み合わせ（表に無いモデルの --thinking off）は、新しいランを作る前に UpdaterUnavailable で失敗する", () => Effect.gen(function* () {
+    const dir = yield* sourceRun;
+    const failure = yield* evalFailure(["--model", "unknown-model", "--thinking", "off", dir]);
+
+    expect(failure.tag).toBe("UpdaterUnavailable");
+    expect(external.layerClaude).not.toHaveBeenCalled();
+    expect(external.openClaudeUpdater).not.toHaveBeenCalled();
+  }));
+
+  it.effect("取りうる値の外の --effort は、流し直す前に失敗する", () => Effect.gen(function* () {
+    const dir = yield* sourceRun;
+    const result = yield* Effect.result(evalCli(["--effort", "extreme", dir]));
+
+    expect(Result.isFailure(result)).toBe(true);
+    expect(external.layerClaude).not.toHaveBeenCalled();
   }));
 });
 

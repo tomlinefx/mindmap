@@ -3,7 +3,7 @@ import { Effect, Exit, Layer, Schema, Scope, Context } from "effect";
 import { TestClock } from "effect/testing";
 import { AgentSdk, layerClaude } from "../src/claude.ts";
 import { DiffUpdater, LogEvent, makeSession, restoreSession, restoreState, type Remark } from "../src/core/index.ts";
-import { defaultClaude } from "../src/modelSelection.ts";
+import { defaultClaude, defaultTuning } from "../src/modelSelection.ts";
 import { collectLog, forbiddenUpdater, settleUntil, silentLog, updaterLayer } from "./fixtures/sessionLayers.ts";
 
 const FIVE_MINUTES = 300_000;
@@ -43,7 +43,7 @@ const claudeUpdater = (script: Script) =>
     const scope = yield* Scope.make();
     yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
     const sdk = Layer.succeed(AgentSdk, AgentSdk.of({ query }));
-    const context = yield* Layer.buildWithScope(layerClaude(defaultClaude.model).pipe(Layer.provide(sdk)), scope);
+    const context = yield* Layer.buildWithScope(layerClaude(defaultClaude.model, defaultTuning(defaultClaude.model)).pipe(Layer.provide(sdk)), scope);
     return { updater: Context.get(context, DiffUpdater), calls: () => call };
   });
 

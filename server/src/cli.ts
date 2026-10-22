@@ -10,7 +10,7 @@ import { portConfig, sessionsDirConfig } from "./config.ts";
 import { withoutFinalNewline } from "./consoleText.ts";
 import { prepareUpdaterLayer } from "./diffUpdater.ts";
 import { UpdaterUnavailable } from "./updaterUnavailable.ts";
-import { claudeModel, type ExecutableModel } from "./modelSelection.ts";
+import { claudeModel, type ExecutableModel, type UpdaterTuning } from "./modelSelection.ts";
 import {
   formatIntakeStatus,
   formatShareOpened,
@@ -269,6 +269,20 @@ const isDirectory = Effect.fn("isDirectory")(function* (path: string) {
 const modelFlag = Flag.String("model").pipe(Flag.withDescription("差分更新に使う Claude のモデルの id（例 claude-haiku-5-5。省略すると claude-sonnet-5-5）"), Flag.optional);
 const resolveModel = (model: Option.Option<string>): ExecutableModel => claudeModel(Option.getOrUndefined(model));
 
+// 差分更新の effort と思考の上書き（play と eval だけ。ライブの start は持たず、モデルごとの表だけを使う）
+const effortFlag = Flag.Literals("effort", ["low", "medium", "high", "xhigh", "max"]).pipe(
+  Flag.withDescription("差分更新の effort を表の値から替える（low・medium・high・xhigh・max。省略するとモデルごとの表の値）"),
+  Flag.optional,
+);
+const thinkingFlag = Flag.Literals("thinking", ["adaptive", "off"]).pipe(
+  Flag.withDescription("差分更新の思考を表の値から替える（adaptive・off。off を渡せないモデルでは始める前に失敗する。省略するとモデルごとの表の値）"),
+  Flag.optional,
+);
+const tuningOverride = (effort: Option.Option<UpdaterTuning["effort"]>, thinking: Option.Option<UpdaterTuning["thinking"]>): Partial<UpdaterTuning> => ({
+  ...(Option.isSome(effort) ? { effort: effort.value } : {}),
+  ...(Option.isSome(thinking) ? { thinking: thinking.value } : {}),
+});
+
 const recordPlayback = Effect.fn("recordPlayback")(function* (
   input: { title: string; remarks: Iterable<PlaybackRemark>; realtime: boolean },
   model: ExecutableModel,
@@ -291,6 +305,8 @@ const play = Command.make(
   "play",
   {
     model: modelFlag,
+    effort: effortFlag,
+    thinking: thinkingFlag,
     transcript: Argument.String("source").pipe(
       Argument.withDescription(
         "再生する文字起こしファイル（kanary transcribe の JSON）、または過去のセッションのフォルダ（log.jsonl を持つフォルダ）。"
@@ -303,9 +319,9 @@ const play = Command.make(
     ),
   },
   Effect.fn("play")(
-    function* ({ realtime, transcript, model }) {
+    function* ({ realtime, transcript, model, effort, thinking }) {
       const selected = resolveModel(model);
-      const updaterLayer = yield* prepareUpdaterLayer(selected);
+      const updaterLayer = yield* prepareUpdaterLayer(selected, tuningOverride(effort, thinking));
       return yield* Effect.gen(function* () {
         const port = yield* portConfig;
         const folder = yield* isDirectory(transcript);
@@ -538,9 +554,9 @@ const review = Command.make(
 );
 
 // 元ログを選んだモデルで再生し、新しいランのフォルダを返す（updater の layer などは呼び出し側の Scope が持つ）
-const replayedRunDir = Effect.fnUntraced(function* (source: string, model: ExecutableModel) {
+const replayedRunDir = Effect.fnUntraced(function* (source: string, model: ExecutableModel, override: Partial<UpdaterTuning>) {
   const recorded = yield* loadSessionLog(resolve(source));
-  const updaterLayer = yield* prepareUpdaterLayer(model);
+  const updaterLayer = yield* prepareUpdaterLayer(model, override);
   return (yield* recordPlayback({ ...recorded, realtime: false }, model, () => Effect.void).pipe(
     Effect.provide(updaterLayer),
   )).dir;
@@ -571,6 +587,8 @@ const evaluate = Command.make(
   "eval",
   {
     model: modelFlag,
+    effort: effortFlag,
+    thinking: thinkingFlag,
     truth: Flag.File("truth").pipe(
       Flag.withDescription("正解ファイル（JSON）。形は core/evaluate.ts の Truth が正本"),
       Flag.optional,
@@ -584,14 +602,17 @@ const evaluate = Command.make(
       Argument.atLeast(1),
     ),
   },
-  Effect.fn("eval")(function* ({ sessions, truth, screenTruth, model }) {
+  Effect.fn("eval")(function* ({ sessions, truth, screenTruth, model, effort, thinking }) {
     // 正解ファイルの検証は共有の readTruthFile（段 1 の Truth の Schema）が持つ（Flag 側では検証しない）
     const expected = Option.isNone(truth) ? undefined : yield* readTruthFile(truth.value);
     const screen = Option.isNone(screenTruth) ? undefined : yield* readScreenTruthFile(screenTruth.value);
     const fs = yield* FileSystem.FileSystem;
     const runs: Run[] = [];
+    // --model・--effort・--thinking のどれかを明示したときだけ流し直す
+    const replay = Option.isSome(model) || Option.isSome(effort) || Option.isSome(thinking);
+    const override = tuningOverride(effort, thinking);
     for (const source of sessions) {
-      const dir = Option.isNone(model) ? source : yield* replayedRunDir(source, resolveModel(model)).pipe(Effect.scoped);
+      const dir = replay ? yield* replayedRunDir(source, resolveModel(model), override).pipe(Effect.scoped) : source;
       runs.push(yield* evaluatedRun(fs, dir));
     }
     const table = yield* formatTable(runs, expected, screen).pipe(
@@ -603,7 +624,7 @@ const evaluate = Command.make(
   Command.withDescription(
     "play で作ったランの指標を 1 ラン 1 行の表で出す。log.jsonl があれば、本文の書き換えの回数÷発言の数・1 ノードの書き換えの最多・話し中の兄弟の最多も出す（無ければ -）。--truth を渡すと決定・TODO の再現率と種別違い（正解が別の種別のノードとして出た数）も、--screen-truth を渡すと指す発言・うち記憶・話だけ・出てはいけないの列も出す"
       + "（当たる条件と 1 対 1 の数え方は core/evaluate.ts の matches・recall が持つ）。"
-      + "--model を明示したときだけ元ログを選んだモデルで再生し、新しいランを評価する。指定なしでは保存済み結果を集計する",
+      + "--model・--effort・--thinking のどれかを明示したときだけ、元ログを選んだモデルと調整で再生し、新しいランを評価する（--effort・--thinking は省略するとモデルごとの表の値）。指定なしでは保存済み結果を集計する",
   ),
 );
 

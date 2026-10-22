@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { Effect, Layer } from "effect";
 import { vi } from "vitest";
 import { AgentSdk, layerClaude } from "../src/claude.ts";
+import { defaultTuning } from "../src/modelSelection.ts";
 import { DiffUpdater, emptyMap } from "../src/core/index.ts";
 
 // 本物の Claude を呼ばない。AgentSdk.layer は通常の依存の SDK の query をそのまま使う（ADR 0002）ので、SDK のモジュールを偽物にする
@@ -18,6 +19,6 @@ describe("通常の依存の SDK を使う AgentSdk", () => {
       const result = yield* updater.update({ map: emptyMap("定例"), recent: [], fresh: [{ id: "r1", track: "相手", start: 0, end: 1, text: "合成の発言" }] });
       expect(result.ops).toEqual([{ op: "noop", reason: "SDK の応答" }]);
       expect(sdk.query).toHaveBeenCalledOnce();
-    }).pipe(Effect.provide(layerClaude("synthetic-model").pipe(Layer.provide(AgentSdk.layer))));
+    }).pipe(Effect.provide(layerClaude("synthetic-model", defaultTuning("synthetic-model")).pipe(Layer.provide(AgentSdk.layer))));
   }).pipe(Effect.scoped));
 });

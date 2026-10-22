@@ -5,6 +5,7 @@ import { Cause, Context, Effect, Exit, Layer, Option, Queue, Ref, Schema, Scope,
 import { DiffOperations, DiffUpdatePaused, DiffUpdater, type DiffInput, type DiffResult, type DiffUsage, type MeetingMap, type ScreenChange } from "./core/index.ts";
 
 import { buildPrompt, OUTPUT_SCHEMA, SYSTEM } from "./claudePrompt.ts";
+import type { UpdaterTuning } from "./modelSelection.ts";
 import { fmtTime } from "./remarkLine.ts";
 
 export { buildPrompt, NOOP_SCOPE } from "./claudePrompt.ts";
@@ -35,11 +36,8 @@ const HAIKU_DECISION_APPEND = [
   "- その作業は、決定とは別に TODO として add する。決定と TODO の両方を残す。",
 ].join("\n");
 
-// モデル名ごとの調整はここだけで決める（#615/#656/#686/#719）。設定の項目にはしない。
-export const claudeTuning = (model: string): { readonly effort: "low" | "medium"; readonly systemAppend: string } =>
-  model === "claude-haiku-5-5"
-    ? { effort: "low", systemAppend: HAIKU_DECISION_APPEND }
-    : { effort: "medium", systemAppend: "" };
+// SYSTEM の追記はモデル名で決める（#719）。effort と思考は UpdaterTuning（modelSelection.ts）が持つ
+const systemAppendOf = (model: string): string => (model === "claude-haiku-5-5" ? HAIKU_DECISION_APPEND : "");
 
 // Agent SDK の query。通常の依存として入れたものをそのまま使う（ADR 0002）。テストでは偽物の Layer に替える
 export class AgentSdk extends Context.Service<AgentSdk, {
@@ -81,13 +79,13 @@ type Open = {
 // 1 つのセッション（会議）で、開いたままの query を使い回す差分更新。
 // 最初の呼び出しで開き、回数・失敗・ストリームの終わりで開き直し、セッションの Scope を閉じると閉じる。
 // 呼び出しは同時に 1 つしか走らない前提（core の session が直列に呼ぶ）。
-export const layerClaude = (model: string) => Layer.effect(
+export const layerClaude = (model: string, tuning: UpdaterTuning) => Layer.effect(
   DiffUpdater,
   Effect.gen(function* () {
     const sdk = yield* AgentSdk;
-    // 調整は初期化で一度だけ決める。query を開き直しても同じ値になる
-    const tuning = claudeTuning(model);
-    const diffSystem = tuning.systemAppend ? `${SYSTEM}\n\n${tuning.systemAppend}` : SYSTEM;
+    // 調整は呼び出し側が決めて渡す。query を開き直しても同じ値になる
+    const systemAppend = systemAppendOf(model);
+    const diffSystem = systemAppend ? `${SYSTEM}\n\n${systemAppend}` : SYSTEM;
     const sessionScope = yield* Scope.Scope;
     const current = yield* Ref.make(Option.none<Open>());
     const closed = yield* Ref.make(false);
@@ -102,6 +100,8 @@ export const layerClaude = (model: string) => Layer.effect(
             prompt: Stream.toAsyncIterable(Stream.fromQueue(input)),
             options: {
               model, systemPrompt, effort: tuning.effort,
+              // adaptive は今までどおり thinking を渡さない。off は disabled（1.1）
+              ...(tuning.thinking === "off" ? { thinking: { type: "disabled" as const } } : {}),
               tools: [], settingSources: [], persistSession: false, maxTurns: 4,
               mcpServers: {}, strictMcpConfig: true, plugins: [], skills: [], agents: {},
               outputFormat: { type: "json_schema", schema },

@@ -1,5 +1,5 @@
 import { defaultClaude } from "../src/modelSelection.ts";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -18,8 +18,8 @@ import { type DiffInput, type Op } from "../src/core/index.ts";
 import { fakeListener } from "./fakeListener.ts";
 import { dataRows, isUnmeasured, rowOf } from "./fixtures/latencyTable.ts";
 
-const external = vi.hoisted(() => ({ openClaudeUpdater: vi.fn(), openListener: vi.fn() }));
-vi.mock("../src/claude.ts", async () => (await import("./fixtures/claudeModule.ts")).fakeClaudeModule(() => external.openClaudeUpdater()));
+const external = vi.hoisted(() => ({ openClaudeUpdater: vi.fn(), openListener: vi.fn(), layerClaude: vi.fn() }));
+vi.mock("../src/claude.ts", async () => (await import("./fixtures/claudeModule.ts")).fakeClaudeModule(() => external.openClaudeUpdater(), (model, tuning) => external.layerClaude(model, tuning)));
 // 配信の待受け（openListener）だけを偽物にする。serveFeed・portOf は本物のまま
 vi.mock("../src/http.ts", async (importOriginal) => ({
   ...await importOriginal<typeof import("../src/http.ts")>(),
@@ -107,6 +107,7 @@ function dependencies(sessionsDir: string, port = "12345") {
 beforeEach(() => {
   external.openClaudeUpdater.mockReset();
   external.openListener.mockReset();
+  external.layerClaude.mockReset();
   external.openClaudeUpdater.mockReturnValue({ update: () => Effect.succeed({ ops: [] }), close: () => {} });
   external.openListener.mockImplementation(fakeListener().open);
 });
@@ -277,6 +278,67 @@ describe("CLI の Effect 境界", () => {
     expect(Result.isFailure(result)).toBe(true);
     expect(close).toHaveBeenCalledTimes(1);
     expect(deps.stdout).toEqual([]);
+  }));
+
+  it.effect("play は、引数なしなら表の調整（medium + adaptive）を layer へ渡す", () => Effect.gen(function* () {
+    const dir = yield* directory;
+    yield* runCli(["play", fixture]).pipe(Effect.provide(dependencies(dir).layer));
+
+    expect(external.layerClaude.mock.calls).toEqual([[defaultClaude.model, { effort: "medium", thinking: "adaptive" }]]);
+  }));
+
+  it.effect("play の --effort と --thinking は、その実行の layer へ届く", () => Effect.gen(function* () {
+    const dir = yield* directory;
+    yield* runCli(["play", fixture, "--effort", "high", "--thinking", "off"]).pipe(Effect.provide(dependencies(dir).layer));
+
+    expect(external.layerClaude.mock.calls).toEqual([[defaultClaude.model, { effort: "high", thinking: "off" }]]);
+  }));
+
+  it.effect("play で --effort だけを渡すと、thinking は表の値のまま（haiku なら low の effort だけが替わる）", () => Effect.gen(function* () {
+    const dir = yield* directory;
+    yield* runCli(["play", fixture, "--model", "claude-haiku-5-5", "--effort", "high"]).pipe(Effect.provide(dependencies(dir).layer));
+
+    expect(external.layerClaude.mock.calls).toEqual([["claude-haiku-5-5", { effort: "high", thinking: "adaptive" }]]);
+  }));
+
+  it.effect("play で渡せない組み合わせ（表に無いモデルの --thinking off）は、待受け・セッション・出力を作る前に UpdaterUnavailable で失敗する", () => Effect.gen(function* () {
+    const dir = yield* directory;
+    const deps = dependencies(dir);
+    const result = yield* Effect.result(runCli(["play", fixture, "--model", "unknown-model", "--thinking", "off"]).pipe(Effect.provide(deps.layer)));
+
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isSuccess(result)) return;
+    expect(Predicate.hasProperty(result.failure, "_tag") && result.failure._tag).toBe("UpdaterUnavailable");
+    expect(external.layerClaude).not.toHaveBeenCalled();
+    expect(external.openClaudeUpdater).not.toHaveBeenCalled();
+    expect(external.openListener).not.toHaveBeenCalled();
+    expect(readdirSync(dir)).toEqual([]);
+    expect(deps.stdout).toEqual([]);
+  }));
+
+  it.effect.each([
+    { name: "effort", args: ["--effort", "extreme"] },
+    { name: "thinking", args: ["--thinking", "between_tools"] },
+  ])("play の --$name が取りうる値の外なら、何も始めずに失敗する", ({ args }) => Effect.gen(function* () {
+    const dir = yield* directory;
+    const result = yield* Effect.result(runCli(["play", fixture, ...args]).pipe(Effect.provide(dependencies(dir).layer)));
+
+    expect(Result.isFailure(result)).toBe(true);
+    expect(external.layerClaude).not.toHaveBeenCalled();
+    expect(external.openListener).not.toHaveBeenCalled();
+    expect(readdirSync(dir)).toEqual([]);
+  }));
+
+  it.effect.each([
+    { flag: "--thinking", value: "off" },
+    { flag: "--effort", value: "high" },
+  ])("ライブのセッションを始める start は $flag を受け付けない（ライブは表の調整だけを使う）", ({ flag, value }) => Effect.gen(function* () {
+    const dir = yield* directory;
+    const server = yield* fakeServer({ status: 200, contentType: "application/json", body: JSON.stringify({ dir: join(dir, "run") }) });
+    const result = yield* Effect.result(runCli(["start", "--app", "zoom.exe", flag, value]).pipe(Effect.provide(dependencies(dir, String(server.port)).layer)));
+
+    expect(Result.isFailure(result)).toBe(true);
+    expect(server.requests).toEqual([]);
   }));
 
   it.effect("失敗した更新は記録して公開せず、最終の書き出しまで updater を保持する。失敗した回の待ち時間は待たない", () => Effect.gen(function* () {

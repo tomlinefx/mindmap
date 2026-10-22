@@ -1,7 +1,7 @@
-import { defaultClaude } from "../src/modelSelection.ts";
+import { defaultClaude, defaultTuning, resolveTuning, type UpdaterTuning } from "../src/modelSelection.ts";
 import { describe, expect, it } from "@effect/vitest";
 import { Cause, Context, Effect, Exit, Fiber, Layer, Scope } from "effect";
-import { AgentSdk, buildPrompt, claudeTuning, layerClaude, NOOP_SCOPE, QUERY_RENEW_CALLS } from "../src/claude.ts";
+import { AgentSdk, buildPrompt, layerClaude, NOOP_SCOPE, QUERY_RENEW_CALLS } from "../src/claude.ts";
 import { OUTPUT_SCHEMA, SYSTEM } from "../src/claudePrompt.ts";
 import { applyOps, DiffUpdater, DiffUpdatePaused } from "../src/core/index.ts";
 import { emptyMap, type DiffInput, type MeetingMap, type Op, type ScreenChange } from "../src/core/index.ts";
@@ -32,7 +32,7 @@ const RESULT_USAGE = { input_tokens: 100, cache_creation_input_tokens: 20, cache
 const RETRIED_RESULT_USAGE = { input_tokens: 230, cache_creation_input_tokens: 45, cache_read_input_tokens: 6100, output_tokens: 1040 };
 type Created = { messages: Message[]; closeCalls: number; options: Options };
 // query() に渡された options（systemPrompt・effort・出力スキーマ・env）
-type Options = { model: string; systemPrompt: string; effort?: string; outputFormat: { type: string; schema: unknown }; env?: Record<string, string | undefined> };
+type Options = { model: string; systemPrompt: string; effort?: string; thinking?: unknown; outputFormat: { type: string; schema: unknown }; env?: Record<string, string | undefined> };
 
 // SDK の resetsAt はエポック秒
 const RESETS_AT_SECONDS = 1791316800;
@@ -104,13 +104,13 @@ const fakeQuery = (created: Created[], behave: (queryIndex: number, messageIndex
 
 // 偽の AgentSdk を layerClaude に渡し、手で作った Scope（セッションの Scope の代わり）の中で build する。
 // close は Scope を閉じる操作（旧 updater.close() の代わり）。何度呼んでもよい
-function setup(behave: (queryIndex: number, messageIndex: number) => Behavior = () => "ok", model: string = defaultClaude.model) {
+function setup(behave: (queryIndex: number, messageIndex: number) => Behavior = () => "ok", model: string = defaultClaude.model, tuning: UpdaterTuning = defaultTuning(model)) {
   return Effect.gen(function* () {
     const created: Created[] = [];
     const scope = yield* Scope.make();
     yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
     const sdk = Layer.succeed(AgentSdk, AgentSdk.of({ query: fakeQuery(created, behave) }));
-    const context = yield* Layer.buildWithScope(layerClaude(model).pipe(Layer.provide(sdk)), scope);
+    const context = yield* Layer.buildWithScope(layerClaude(model, tuning).pipe(Layer.provide(sdk)), scope);
     const updater = Context.get(context, DiffUpdater);
     return { created, updater, scope, close: Scope.close(scope, Exit.void) };
   });
@@ -2001,9 +2001,9 @@ const HAIKU_APPEND = [
   "- その作業は、決定とは別に TODO として add する。決定と TODO の両方を残す。",
 ].join("\n");
 
-const optionsAfterRenew = (model: string) =>
+const optionsAfterRenew = (model: string, tuning: UpdaterTuning = defaultTuning(model)) =>
   Effect.gen(function* () {
-    const { created, updater, close } = yield* setup(() => "ok", model);
+    const { created, updater, close } = yield* setup(() => "ok", model, tuning);
     for (let n = 1; n <= QUERY_RENEW_CALLS + 1; n++) yield* updater.update(input(n));
     yield* close;
     return created.map((c) => c.options);
@@ -2018,7 +2018,6 @@ describe("モデル名ごとの effort と SYSTEM の追記（Issue #719）", ()
       expect(created).toHaveLength(1);
       expect(created[0]!.options.model).toBe(HAIKU);
       expect(created[0]!.options.effort).toBe("low");
-      expect(claudeTuning(HAIKU).systemAppend).toBe(HAIKU_APPEND);
       expect(created[0]!.options.systemPrompt.startsWith(SYSTEM)).toBe(true);
       expect(created[0]!.options.systemPrompt.endsWith(HAIKU_APPEND)).toBe(true);
       expect(created[0]!.options.systemPrompt.length).toBeGreaterThan(SYSTEM.length + HAIKU_APPEND.length);
@@ -2050,6 +2049,39 @@ describe("モデル名ごとの effort と SYSTEM の追記（Issue #719）", ()
       }
     }));
 
+});
+
+describe("差分更新の調整（UpdaterTuning）が query() の options に届く（タスク 8.1）", () => {
+  it.effect("既定の調整（adaptive）では options に thinking のキー自体を渡さない（今と同じ呼び出し）", () =>
+    Effect.gen(function* () {
+      for (const model of [HAIKU, defaultClaude.model, "unknown-model"]) {
+        const { created, updater } = yield* setup(() => "ok", model);
+        yield* updater.update(input(1));
+
+        expect("thinking" in created[0]!.options).toBe(false);
+      }
+    }));
+
+  it.effect("thinking: off は { type: disabled } として query() に渡り、query を開き直したあとも同じ", () =>
+    Effect.gen(function* () {
+      const seen = yield* optionsAfterRenew(defaultClaude.model, resolveTuning(defaultClaude.model, { thinking: "off" }));
+
+      expect(seen).toHaveLength(2);
+      expect(seen[0]!.thinking).toEqual({ type: "disabled" });
+      expect(seen[1]!.thinking).toEqual({ type: "disabled" });
+      expect(seen[0]!.effort).toBe("medium");
+    }));
+
+  it.effect("effort だけ上書きすると、その effort が開き直したあとも渡り、thinking は渡さないまま（adaptive）", () =>
+    Effect.gen(function* () {
+      const seen = yield* optionsAfterRenew(HAIKU, resolveTuning(HAIKU, { effort: "high" }));
+
+      expect(seen).toHaveLength(2);
+      expect(seen.map((o) => o.effort)).toEqual(["high", "high"]);
+      expect(seen.some((o) => "thinking" in o)).toBe(false);
+      // systemPrompt の追記はモデルに付くもので、調整の上書きでは変わらない
+      expect(seen[0]!.systemPrompt.endsWith(HAIKU_APPEND)).toBe(true);
+    }));
 });
 
 describe("共有画面（DiffInput.screens）の描画", () => {

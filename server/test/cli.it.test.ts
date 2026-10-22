@@ -311,6 +311,34 @@ describe("CLI", () => {
     }));
   });
 
+  // helper の stt-file --transcript が書く形（track は microphone、本文は偽の STT の「（音声 a.b–c.d 秒）」）。
+  // 同じ録音を VAD の無音の長さだけ替えた 2 本（区切りが違う）が、どちらも play で流せる
+  describe("play: stt-file の文字起こし（無音の長さ違いの 2 本）", () => {
+    const segment = (start: number, end: number) => ({ track: "microphone", start_seconds: start, end_seconds: end, text: `（音声 ${start.toFixed(1)}–${end.toFixed(1)} 秒）` });
+    const transcript = (...segments: ReturnType<typeof segment>[]) => JSON.stringify({ transcript: { segments } });
+
+    it.effect("区切りの違う 2 本は、どちらも play でき、それぞれの発言（自分）が区切りどおりに updater へ渡る", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const split = join(dir, "silence-0.5.transcript.json");
+      const joined = join(dir, "silence-2.0.transcript.json");
+      writeFileSync(split, transcript(segment(0, 1.2), segment(2.2, 3.4)));
+      writeFileSync(joined, transcript(segment(0, 3.4)));
+
+      const played = (path: string) => Effect.gen(function* () {
+        const deps = dependencies(dir);
+        const { calls } = scripted([]);
+        yield* runCli(["play", path]).pipe(Effect.provide(deps.layer));
+        return calls.flatMap((c) => c.fresh.map((u) => ({ id: u.id, track: u.track, start: u.start, end: u.end, text: u.text })));
+      });
+
+      expect(yield* played(split)).toEqual([
+        { id: "r1", track: "自分", start: 0, end: 1.2, text: "（音声 0.0–1.2 秒）" },
+        { id: "r2", track: "自分", start: 2.2, end: 3.4, text: "（音声 2.2–3.4 秒）" },
+      ]);
+      expect(yield* played(joined)).toEqual([{ id: "r1", track: "自分", start: 0, end: 3.4, text: "（音声 0.0–3.4 秒）" }]);
+    }));
+  });
+
   describe("restore", () => {
     const adoptionScript: Op[][] = script;
 

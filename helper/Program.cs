@@ -5,7 +5,7 @@ using Mindmap.Helper.Transcription;
 //   mindmap-helper list
 //   mindmap-helper check
 //   mindmap-helper run --app <id> --port <n> [--origin <hostTime>] [--self-manual pause|take] [--vad-silence <秒>]
-//   mindmap-helper stt-file <wav> [--vad-silence <秒>]
+//   mindmap-helper stt-file <wav> [--vad-silence <秒>] [--transcript <out.json>]
 static string? Option(string[] args, string name)
 {
     var index = Array.IndexOf(args, name);
@@ -55,7 +55,7 @@ switch (command)
         if (!TryVadSilence(args, out var minSilence)) return 2;
         var newTranscriber = Transcriber(minSilence);
         if (newTranscriber is null) return 1;
-        return SttFile.Run(path, newTranscriber);
+        return SttFile.Run(path, newTranscriber, Option(args, "--transcript"));
     }
     case "capture-wav":
     {
@@ -69,22 +69,22 @@ switch (command)
 }
 
 // 端末内 STT（sherpa-onnx）。MINDMAP_STT=fake なら偽の STT（音声のパイプラインの確認用）。モデルが無ければ null（理由は標準エラーに出す）
-static Func<ITranscriber>? Transcriber(float minSilence)
+static Func<ITranscriber>? Transcriber(float? minSilence)
 {
-    if (Environment.GetEnvironmentVariable("MINDMAP_STT") == "fake") return () => new FakeTranscriber();
+    if (Environment.GetEnvironmentVariable("MINDMAP_STT") == "fake") return () => minSilence is { } seconds ? new FakeTranscriber(seconds) : new FakeTranscriber();
     var files = ModelFiles.Find(Check.ModelDirectory);
     if (files is null)
     {
         Console.Error.WriteLine($"端末内 STT のモデルがありません: {Check.ModelDirectory}（scripts/win-stt-models.cmd で入れる）");
         return null;
     }
-    return () => new SherpaTranscriber(files, minSilence: minSilence);
+    return () => new SherpaTranscriber(files, minSilence: minSilence ?? 0.6f);
 }
 
-// --vad-silence <秒>: VAD が区間を閉じる無音の長さ。省略なら 0.6。正の数でなければ理由を標準エラーに出して false
-static bool TryVadSilence(string[] args, out float minSilence)
+// --vad-silence <秒>: VAD が区間を閉じる無音の長さ。省略なら null（sherpa は 0.6、偽の STT は 0.8）。正の数でなければ理由を標準エラーに出して false
+static bool TryVadSilence(string[] args, out float? minSilence)
 {
-    minSilence = 0.6f;
+    minSilence = null;
     if (Array.IndexOf(args, "--vad-silence") < 0) return true;
     var value = Option(args, "--vad-silence");
     if (value is not null && float.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var seconds) && float.IsFinite(seconds) && seconds > 0)

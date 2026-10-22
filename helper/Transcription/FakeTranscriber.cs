@@ -3,13 +3,13 @@ namespace Mindmap.Helper.Transcription;
 /// <summary>
 /// 偽の STT。音声のパイプライン（取得 → WebSocket → server）を通すための足場で、文字は作らない。
 /// 音がある区間（RMS がしきい値以上）が続くと途中結果を、区間が途切れるか 5 秒を超えると確定結果を返す。本文は「（音声 a.b–c.d 秒）」。
-/// 端末内 STT（sherpa-onnx）ができたら、この実装は差し替える。
+/// 区間を閉じる無音の長さは --vad-silence で替えられる（省略は 0.8 秒）。端末内 STT（sherpa-onnx）ができたら、この実装は差し替える。
 /// </summary>
-public sealed class FakeTranscriber : ITranscriber
+public sealed class FakeTranscriber(double silenceToClose = FakeTranscriber.DefaultSilenceToClose) : ITranscriber
 {
+    public const double DefaultSilenceToClose = 0.8; // --vad-silence を省いたときの区間を閉じる無音の長さ（秒）
     private const double Threshold = 0.01; // RMS。これ未満は無音
     private const double MaxSegment = 5.0;
-    private const double SilenceToClose = 0.8;
 
     public string Label { get; set; } = "fake";
     public event Action<TranscriptionResult>? OnResult;
@@ -35,7 +35,7 @@ public sealed class FakeTranscriber : ITranscriber
             }
             if (endSeconds - segmentStart.Value >= MaxSegment) Close(endSeconds);
         }
-        else if (segmentStart is not null && endSeconds - lastVoice >= SilenceToClose)
+        else if (segmentStart is not null && endSeconds - lastVoice >= silenceToClose)
         {
             Close(lastVoice);
         }

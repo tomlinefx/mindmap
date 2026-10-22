@@ -5,9 +5,9 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "@effect/vitest";
-import { Effect } from "effect";
+import { Effect, Schema } from "effect";
 import { WebSocket } from "ws";
-import { decodeHelperEvent } from "../src/core/index.ts";
+import { decodeHelperEvent, fromTranscript, TranscriptFile } from "../src/core/index.ts";
 import { DEFAULT_HELPER_PATH, HELPER_BUILD_COMMAND } from "../src/helperPath.ts";
 
 // 実物の helper（Release のビルド）を `run` で起動し、WebSocket で受けた最初のイベントを見る。
@@ -216,8 +216,8 @@ describe("helper の stt-file の区切り（segment-end）（実物の helper�
   }, 60_000);
 });
 
-// `--vad-silence <秒>`（VAD の無音の長さ）は run と stt-file が受ける。偽の STT には VAD が無いので値は使われないが、
-// 値の検査（正の数だけ受ける。違えば終了コード 2 と標準エラーの説明）と「省略しても指定しても同じ動き」は偽の STT で見られる
+// `--vad-silence <秒>`（VAD の無音の長さ）は run と stt-file が受ける。偽の STT も、この長さの無音で区間を閉じる（省略時は 0.8 秒）。
+// 値の検査（正の数だけ受ける。違えば終了コード 2 と標準エラーの説明）と「省略と同じ区切りになる値なら同じ動き」は偽の STT で見られる
 describe("helper の --vad-silence の引数（実物の helper、偽の STT）", () => {
   let dir: string;
 
@@ -260,7 +260,7 @@ describe("helper の --vad-silence の引数（実物の helper、偽の STT）"
     expect(done.stdout.trim()).toBe("");
   }, 60_000);
 
-  it.skipIf(process.platform !== "win32").each(["0.6", "1.5", "0.3"])("stt-file: --vad-silence %s を付けても受け付けられ、省略したときと同じ区間（種類と start）の結果が出る", async (value) => {
+  it.skipIf(process.platform !== "win32").each(["0.6", "0.9", "0.3"])("stt-file: --vad-silence %s を付けても受け付けられ、（1.5 秒の無音はどの値でも区切られるので）省略したときと同じ区間（種類と start）の結果が出る", async (value) => {
     const path = await voicePath();
     const omitted = helper(["stt-file", path]);
     const given = helper(["stt-file", path, "--vad-silence", value]);
@@ -268,5 +268,91 @@ describe("helper の --vad-silence の引数（実物の helper、偽の STT）"
     expect(omitted.status).toBe(0);
     expect(given.status).toBe(0);
     expect(shape(given.stdout)).toEqual(shape(omitted.stdout));
+  }, 60_000);
+});
+
+// `stt-file --transcript <出力>` は確定結果だけを、`cli play` が読む文字起こしの JSON（TranscriptFile）で書く。
+// 同じ録音を無音の長さだけ替えて流すと、別の区切りの発言列ができる（偽の STT でも --vad-silence の長さで区間を閉じる）
+describe("helper の stt-file --transcript（実物の helper、偽の STT）", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "mindmap-helper-transcript-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // 声 1.2 秒 → 無音 1.0 秒 → 声 1.2 秒。無音 1.0 秒は 0.5 秒では区切られ、2.0 秒では区切られない
+  const recording = async () => {
+    const path = join(dir, "voice.wav");
+    await writeFile(path, wav([{ seconds: 1.2, voiced: true }, { seconds: 1.0, voiced: false }, { seconds: 1.2, voiced: true }]));
+    return path;
+  };
+
+  const sttFile = (wavPath: string, extra: ReadonlyArray<string>) => {
+    if (!existsSync(DEFAULT_HELPER_PATH)) throw new Error(`helper のビルドがありません: ${DEFAULT_HELPER_PATH}（${HELPER_BUILD_COMMAND}）`);
+    return spawnSync(DEFAULT_HELPER_PATH, ["stt-file", wavPath, ...extra], { env: { ...process.env, MINDMAP_STT: "fake" }, encoding: "utf8", timeout: 30_000 });
+  };
+
+  const readTranscript = async (path: string) => {
+    const file = await Effect.runPromise(Schema.decodeUnknownEffect(Schema.fromJsonString(TranscriptFile))(await readFile(path, "utf8")));
+    return { file, remarks: fromTranscript(file) };
+  };
+
+  it.skipIf(process.platform !== "win32")("確定結果ごとに 1 区間、track は microphone（play が 自分 として読む）で、start/end/text は標準出力の remark と同じ", async () => {
+    const out = join(dir, "short.transcript.json");
+    const done = sttFile(await recording(), ["--vad-silence", "0.5", "--transcript", out]);
+    expect(done.status).toBe(0);
+
+    const events = done.stdout.split("\n").filter((line) => line.trim().length > 0).map((line) => JSON.parse(line) as Frame);
+    const remarks = events.filter((event) => event.type === "remark");
+    const { file, remarks: played } = await readTranscript(out);
+
+    expect(remarks).toHaveLength(2);
+    expect(file.transcript.segments.map((s) => s.track)).toEqual(["microphone", "microphone"]);
+    expect(file.transcript.segments.map((s) => [s.start_seconds, s.end_seconds, s.text])).toEqual(remarks.map((r) => [r.start, r.end, r.text]));
+    expect(played.map((r) => r.track)).toEqual(["自分", "自分"]);
+    expect(played.map((r) => r.id)).toEqual(["r1", "r2"]);
+  }, 60_000);
+
+  it.skipIf(process.platform !== "win32")("同じ録音を無音 0.5 秒と 2.0 秒で流すと、区切りの違う発言列（2 件と 1 件）になる", async () => {
+    const wavPath = await recording();
+    const short = join(dir, "silence-0.5.transcript.json");
+    const long = join(dir, "silence-2.0.transcript.json");
+    expect(sttFile(wavPath, ["--vad-silence", "0.5", "--transcript", short]).status).toBe(0);
+    expect(sttFile(wavPath, ["--vad-silence", "2.0", "--transcript", long]).status).toBe(0);
+
+    const shortRemarks = (await readTranscript(short)).remarks;
+    const longRemarks = (await readTranscript(long)).remarks;
+
+    expect(shortRemarks).toHaveLength(2);
+    expect(longRemarks).toHaveLength(1);
+    expect(longRemarks[0]?.start).toBe(shortRemarks[0]?.start);
+    expect(longRemarks[0]?.end).toBe(shortRemarks[1]?.end);
+    expect(longRemarks[0]?.text).not.toBe(shortRemarks[0]?.text);
+  }, 60_000);
+
+  it.skipIf(process.platform !== "win32")("--vad-silence を省略した偽の STT は従来どおり 0.8 秒で区切る（無音 1.0 秒で 2 件）", async () => {
+    const out = join(dir, "default.transcript.json");
+    expect(sttFile(await recording(), ["--transcript", out]).status).toBe(0);
+
+    expect((await readTranscript(out)).remarks).toHaveLength(2);
+  }, 60_000);
+
+  it.skipIf(process.platform !== "win32")("--transcript を付けなくても標準出力は partial・remark・segment-end のイベントだけ", async () => {
+    const done = sttFile(await recording(), []);
+
+    expect(done.status).toBe(0);
+    for (const line of done.stdout.split("\n").filter((l) => l.trim().length > 0)) {
+      expect(["partial", "remark", "segment-end"]).toContain((JSON.parse(line) as Frame).type);
+    }
+  }, 60_000);
+
+  it.skipIf(process.platform !== "win32")("書き込めない出力先では、0 以外の終了コードで理由を標準エラーに出す", async () => {
+    const done = sttFile(await recording(), ["--transcript", join(dir, "no-such-dir", "out.transcript.json")]);
+
+    expect(done.status).not.toBe(0);
+    expect(done.stderr.length).toBeGreaterThan(0);
   }, 60_000);
 });

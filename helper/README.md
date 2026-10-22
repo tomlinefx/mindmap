@@ -26,7 +26,7 @@ dotnet build -c Release helper                       # 実行ファイルは hel
 helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe list    # 音を出している会議アプリを JSON で出す
 helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe check   # マイクの許可・STT のモデルの状態を JSON で出す
 helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe run --app Zoom.exe --port 8765 [--origin <hostTime>] [--self-manual pause|take] [--vad-silence <秒>]
-helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe stt-file <wav> [--vad-silence <秒>]   # 開発用。モデルの確認
+helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe stt-file <wav> [--vad-silence <秒>] [--transcript <out.json>]   # 開発用。モデルの確認
 helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe capture-wav other 10 out.wav Zoom.exe   # 開発用。Process Loopback の確認（app id を省くと再生デバイス全体）
 helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe capture-wav aec 10 out.wav Zoom.exe     # 開発用。エコーキャンセルの確認（out.wav = 消した後、out.mic.wav = 消す前、out.ref.wav = 参照）
 ```
@@ -36,9 +36,10 @@ helper/bin/Release/net10.0-windows/win-x64/mindmap-helper.exe capture-wav aec 10
 エコーキャンセルの `webrtc-apm.dll` は `scripts/win-webrtc-apm.cmd` で `helper/.deps/webrtc-apm/lib/` に作る（Visual Studio の「C++ によるデスクトップ開発」が要る。meson と ninja は uv が一時的に用意する）。あれば `dotnet build` が実行ファイルの隣に写す。無くても `run` は動き、エコーキャンセル無しで続ける旨を標準エラーに出す。
 
 - `--app`: `list` の id（実行ファイル名）。そのプロセスの音だけを Process Loopback で取る。PID は音を出しているプロセスを優先し、無ければ同じ名前で最初に始まったもの（子プロセスの音も一緒に取る）。動いていなければ知らせたうえで始め、再生デバイス全体の音を取る。セッションの途中で会議アプリを終了して起動し直すと PID が変わるので、相手の音は届かなくなる（`tap-silent` が出る。セッションの起動し直しで追い直す）
+- `--transcript <出力>`（`stt-file` だけ）: 確定結果を `cli play` に流せる文字起こしの JSON（track は `microphone`）で書く。`--vad-silence` を替えて同じ録音を流し直すと、区切りの違う発言列ができる。標準出力のイベントは変わらない。書けなければ終了コード 1
 - `--origin`: 起動し直しのとき、server が最初の起動の `origin` の値を渡す。無ければ自分で原点を決める。どちらでも起動直後に `origin` を送る
 - `--self-manual`: 起動し直しのとき、server が覚えていた手動の休止の状態
-- `--vad-silence`（`run`・`stt-file`）: VAD が区間を閉じる無音の長さ（秒、0 より大きい数）。既定 0.6。端末内 STT（sherpa）だけに効き、偽の STT では使わない。数でないか 0 以下なら終了コード 2
+- `--vad-silence`（`run`・`stt-file`）: VAD が区間を閉じる無音の長さ（秒、0 より大きい数）。既定は端末内 STT（sherpa）が 0.6、偽の STT が 0.8。数でないか 0 以下なら終了コード 2
 - 環境変数 `LIVE_MINDMAP_HELPER_CONTROL_TOKEN`: server からの指示の合言葉。指示の JSON の `token` と比べる
 - 環境変数 `MINDMAP_STT_MODEL`: 端末内 STT のモデルのフォルダ（既定 `%LOCALAPPDATA%\mindmap\models\stt`）
 - 環境変数 `MINDMAP_STT=fake`: 偽の STT（音声のパイプラインの確認用）
