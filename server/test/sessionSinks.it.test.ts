@@ -7,7 +7,7 @@ import { NodeFileSystem } from "@effect/platform-node";
 import { describe, expect, it } from "@effect/vitest";
 import { Cause, Console, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect";
 import { TestClock } from "effect/testing";
-import { DiffUpdatePaused, DiffUpdater, REVIEW_LOG_ELEMENT_ID, SETTLE_QUIET_MS, type DiffInput, type Snapshot, type CaptionsFrame } from "../src/core/index.ts";
+import { DiffUpdatePaused, DiffUpdater, REVIEW_LOG_ELEMENT_ID, SETTLE_QUIET_MS, samePendingRemarksFrame, type DiffInput, type Snapshot, type CaptionsFrame, type PendingRemarksFrame } from "../src/core/index.ts";
 import { ReviewBuild } from "../src/review.ts";
 import { SessionSinks } from "../src/sessionSinks.ts";
 import { SPEAKING_INTERVAL_MS } from "../src/speakingRelay.ts";
@@ -344,21 +344,24 @@ const hasBubble = (speaks: readonly CaptionsFrame[], track: "相手" | "自分",
 const lastTexts = (speaks: readonly CaptionsFrame[], track: "相手" | "自分") => speaks.at(-1)?.bubbles.filter((b) => b.track === track).map((b) => b.text);
 
 // 公開したスナップショット・送った captions を記録する Sink の組み立て
-const openRecordingSink = Effect.fn("openRecordingSink")(function* ({ speakerOff = true }: { speakerOff?: boolean } = {}) {
+const openRecordingSink = Effect.fn("openRecordingSink")(function* ({ speakerOff = true, originWall }: { speakerOff?: boolean; originWall?: Effect.Effect<number | undefined> } = {}) {
   const sessionsDir = yield* withTmpSessionsDir();
   const sinks = yield* SessionSinks;
   const dir = yield* sinks.createDir(sessionsDir);
   const speaks: CaptionsFrame[] = [];
   const published: Snapshot[] = [];
+  const pendings: PendingRemarksFrame[] = [];
   const sink = yield* sinks.open({ diffUpdate: () => Effect.void, updaterLayer: yield* sinks.prepare(defaultClaude), model: defaultClaude,
     dir,
     title: "週次",
     publish: (snapshot) => Effect.sync(() => void published.push(snapshot)),
     speak: (frame) => Effect.sync(() => void speaks.push(frame)),
     speakerNames: () => Effect.void,
+    pendingRemarks: (frame) => Effect.sync(() => void pendings.push(frame)),
+    ...(originWall === undefined ? {} : { originWall }),
   });
   if (speakerOff) yield* sink.speaker(SPEAKER_OFF);
-  return { sink, dir, speaks, published };
+  return { sink, dir, speaks, published, pendings };
 });
 
 // 差分更新に渡った入力を記録する偽の DiffUpdater の Layer。
@@ -761,7 +764,7 @@ describe("SessionSinks（実物 Layer）: 発言の語ごとの読み（Issue #6
 
       const lines = remarkLines(dir);
       expect(lines).toHaveLength(2);
-      for (const line of lines) expect(Object.keys(line).sort()).toEqual(["at", "remark", "type"].filter((k) => k in line));
+      for (const line of lines) expect(Object.keys(line).sort()).toEqual(["at", "remark", "settledAt", "shownAt", "type"]); // shownAt は取り込み待ちに載った発言の行に付く（map-update-latency 6.4）。settledAt は全ての発言の行に付く（7.1）
       for (const line of lines) {
         expect(line).not.toHaveProperty("raw");
         expect(line).not.toHaveProperty("words");
@@ -982,7 +985,7 @@ describe("SessionSink: 相手の発言の話者を決める（Issue #1021）", (
         const { sink, dir } = yield* open();
         yield* sink.final(finalRemark("相手", 10, 12, "来週に開催します"));
 
-        yield* TestClock.adjust(600_000); // 壁時計では数えない
+        yield* TestClock.adjust(1999); // 壁時計の 2 秒（保留の期限）の手前。この間は音声の時計だけで数える
         yield* tick(sink, 14.999);
         yield* settle;
         expect(loggedRemarks(dir)).toEqual([]);
@@ -1002,6 +1005,23 @@ describe("SessionSink: 相手の発言の話者を決める（Issue #1021）", (
         yield* settle;
         expect(loggedRemarks(dir)).toEqual([emitted]);
         expect(calls.flatMap((c) => c.fresh)).toEqual([emitted]);
+      })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+    });
+
+    it.effect("原点の壁時計を渡すと、ラベルが揃わない発言は音声の終わりから壁時計で 2 秒後に（1 ミリ秒前までは出さず）話者なしで出る。音声の時計は進めない", () => {
+      const { calls, updaterLayer } = makeRecordingUpdater();
+      return Effect.scoped(Effect.gen(function* () {
+        const { sink, dir } = yield* openRecordingSink({ speakerOff: false, originWall: Effect.succeed(0) });
+        yield* sink.final(finalRemark("相手", 10, 12, "来週に開催します"));
+
+        yield* TestClock.adjust(12 * 1000 + 2000 - 1);
+        yield* settle;
+        expect(loggedRemarks(dir)).toEqual([]);
+
+        yield* TestClock.adjust(1);
+        yield* settleUntil(() => calls.flatMap((c) => c.fresh).length === 1);
+        expect(loggedRemarks(dir)).toEqual([{ id: "r1", track: "相手", start: 10, end: 12, text: "来週に開催します" }]);
+        expect("speaker" in loggedRemarks(dir)[0]).toBe(false);
       })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
     });
 
@@ -1598,5 +1618,579 @@ describe("SessionSink: 相手の発言の話者を決める（Issue #1021）", (
         expect(logEvents(dir).filter((e) => e.type === "speaker-settled").map(({ at, ...rest }) => rest)).toEqual([{ type: "speaker-settled", track: "相手", to: 3 }]);
       })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
     });
+  });
+});
+
+// map-update-latency 6.2: 保留・順番待ち・呼び出し・外した発言の出入りごとに取り込み待ちのフレームを組み、前と同じ中身なら配信しない。
+// 1 つの open したセッションの上で、保留 → 順番待ち → 取り込み中 → （時間切れ・失敗で戻る）→ 反映、と続けて観測する
+describe("SessionSink: 取り込み待ちのフレーム（map-update-latency 6.2）", () => {
+  type UpdateStep = "ok" | "gate" | "hang" | "invalid";
+  // n 回目の呼び出しは steps[n-1] の通りに振る舞う（超えたら成功）。gate は、テストが置いた Deferred が完了するまで返らない
+  const makeScriptedUpdater = (steps: readonly UpdateStep[]) => {
+    const calls: DiffInput[] = [];
+    const gate: { current: Deferred.Deferred<void> | null } = { current: null };
+    const updaterLayer = Layer.succeed(DiffUpdater, DiffUpdater.of({
+      update: (input) => Effect.gen(function* () {
+        calls.push(input);
+        const step = steps[calls.length - 1] ?? "ok";
+        if (step === "gate" && gate.current !== null) yield* Deferred.await(gate.current);
+        if (step === "hang") return yield* Effect.never;
+        if (step === "invalid") return yield* Effect.fail({ _tag: "DiffOutputInvalid", message: "出力が不正" });
+        return { ops: [] };
+      }),
+    }));
+    return { calls, gate, updaterLayer };
+  };
+  const openGate = (gate: { current: Deferred.Deferred<void> | null }) =>
+    Effect.map(Deferred.make<void>(), (made) => { gate.current = made; return made; });
+  const view = (frame: PendingRemarksFrame | undefined) => frame?.remarks.map((r) => `${r.state}:${r.key}`);
+  const views = (frames: readonly PendingRemarksFrame[]) => frames.map(view);
+  const finalWith = (sink: { final: (r: { track: "相手"; start: number; end: number; text: string }) => Effect.Effect<void> }, start: number, end: number, text: string) =>
+    sink.final({ track: "相手", start, end, text });
+  const segment = (slot: number, start: number, end: number) => ({ type: "speaker", track: "相手", start, end, slot, final: true }) as const;
+  const settledAt = (to: number) => ({ type: "speaker-settled", track: "相手", to }) as const;
+  // 隣り合うフレームは必ず中身が違い、最初のフレームは空ではない（空 → 空を配信しない）
+  const expectNoRepeats = (frames: readonly PendingRemarksFrame[]) => {
+    if (frames.length > 0) expect(frames[0]!.remarks.length).toBeGreaterThan(0);
+    frames.slice(1).forEach((frame, i) => expect(samePendingRemarksFrame(frames[i]!, frame), `${i + 1} 番目と ${i + 2} 番目`).toBe(false));
+  };
+
+  it.effect("保留に入ると waiting のフレームが 1 回出る。同じ中身の通知（話者の区間が届いても揃わない）では増えない", () => {
+    const { updaterLayer } = makeScriptedUpdater([]);
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, pendings } = yield* openRecordingSink({ speakerOff: false });
+      yield* finalWith(sink, 10, 12, "来週に開催します");
+      yield* settleUntil(() => pendings.length === 1);
+      expect(views(pendings)).toEqual([["waiting:相手:10"]]);
+      expect(pendings[0]!.remarks[0]).toMatchObject({ track: "相手", text: "来週に開催します", start: 10, end: 12, state: "waiting" });
+
+      yield* sink.speaker(segment(2, 10, 11)); // 終わりまで揃わない: 保留のまま
+      yield* sink.speaker(settledAt(11));
+      yield* settle;
+      expect(pendings).toHaveLength(1);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("話者がそろって保留から出ると、同じ発言が waiting から reflecting に替わる。間に項目が消えた空のフレームは出ず、waiting が戻ることもない。反映が済むと空のフレームが出る", () => {
+    const { calls, gate, updaterLayer } = makeScriptedUpdater(["gate"]);
+    return Effect.scoped(Effect.gen(function* () {
+      const release = yield* openGate(gate);
+      const { sink, pendings } = yield* openRecordingSink({ speakerOff: false });
+      yield* finalWith(sink, 10, 12, "来週に開催します");
+      yield* sink.speaker(segment(2, 10, 12));
+      yield* sink.speaker(settledAt(12));
+      yield* settleUntil(() => calls.length === 1);
+      yield* settle;
+
+      const seen = views(pendings);
+      expect(seen[0]).toEqual(["waiting:相手:10"]);
+      expect(view(pendings.at(-1))).toEqual(["reflecting:r1"]);
+      expect(pendings.every((f) => f.remarks.length === 1)).toBe(true); // 出入りの間に消えない
+      const firstOut = seen.findIndex((v) => v?.[0] !== "waiting:相手:10");
+      expect(seen.slice(firstOut).every((v) => v?.[0] !== "waiting:相手:10")).toBe(true); // 出たあと waiting は戻らない
+      expect(pendings.at(-1)!.remarks[0]).toMatchObject({ id: "r1", text: "来週に開催します", speaker: "相手 A", state: "reflecting" });
+
+      yield* Deferred.succeed(release, undefined);
+      yield* sink.flush;
+      yield* settleUntil(() => pendings.at(-1)?.remarks.length === 0);
+      expectNoRepeats(pendings);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("保留の期限（壁時計で 2 秒）で出るときも、waiting から reflecting に替わり、空のフレームを挟まない", () => {
+    const { calls, gate, updaterLayer } = makeScriptedUpdater(["gate"]);
+    return Effect.scoped(Effect.gen(function* () {
+      const release = yield* openGate(gate);
+      const { sink, pendings } = yield* openRecordingSink({ speakerOff: false, originWall: Effect.succeed(0) });
+      yield* finalWith(sink, 10, 12, "来週に開催します");
+      yield* settleUntil(() => pendings.length === 1);
+      expect(views(pendings)).toEqual([["waiting:相手:10"]]);
+
+      yield* TestClock.adjust(12 * 1000 + 2000);
+      yield* settleUntil(() => calls.length === 1);
+      yield* settle;
+      expect(view(pendings.at(-1))).toEqual(["reflecting:r1"]);
+      expect(pendings.every((f) => f.remarks.length === 1)).toBe(true);
+      yield* Deferred.succeed(release, undefined);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("drain で保留から出るときも、waiting が残らず reflecting になる", () => {
+    const { calls, gate, updaterLayer } = makeScriptedUpdater(["gate"]);
+    return Effect.scoped(Effect.gen(function* () {
+      const release = yield* openGate(gate);
+      const { sink, pendings } = yield* openRecordingSink({ speakerOff: false });
+      yield* finalWith(sink, 10, 12, "来週に開催します");
+      yield* settleUntil(() => pendings.length === 1);
+      yield* Effect.forkChild(sink.drain);
+      yield* settleUntil(() => calls.length === 1);
+      yield* settle;
+      expect(view(pendings.at(-1))).toEqual(["reflecting:r1"]);
+      expect(pendings.every((f) => f.remarks.length === 1)).toBe(true);
+      yield* Deferred.succeed(release, undefined);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("呼び出し中は reflecting、その間に届いた発言は queued で並ぶ。反映が済むと空になり、最初の空 → 空は配信しない", () => {
+    const { calls, gate, updaterLayer } = makeScriptedUpdater(["gate"]);
+    return Effect.scoped(Effect.gen(function* () {
+      const release = yield* openGate(gate);
+      const { sink, pendings } = yield* openRecordingSink();
+      expect(pendings).toEqual([]); // 何も無いうちは配信しない
+      yield* finalWith(sink, 1, 2, "ひとつめ");
+      yield* settleUntil(() => calls.length === 1);
+      yield* settle;
+      expect(view(pendings.at(-1))).toEqual(["reflecting:r1"]);
+
+      yield* finalWith(sink, 3, 4, "ふたつめ");
+      yield* settleUntil(() => view(pendings.at(-1))?.length === 2);
+      expect(view(pendings.at(-1))).toEqual(["reflecting:r1", "queued:r2"]);
+
+      yield* Deferred.succeed(release, undefined);
+      yield* sink.flush;
+      yield* settleUntil(() => pendings.at(-1)?.remarks.length === 0);
+      expect(calls.map((c) => c.fresh.map((r) => r.id))).toEqual([["r1"], ["r2"]]);
+      expectNoRepeats(pendings);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("時間切れの回の発言はフレームに残り（queued）、次の呼び出しで reflecting になって反映されると外れる。時間切れでは failed にならない", () => {
+    const { calls, updaterLayer } = makeScriptedUpdater(["hang", "ok"]);
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, pendings } = yield* openRecordingSink();
+      yield* finalWith(sink, 1, 2, "ひとつめ");
+      yield* settleUntil(() => calls.length === 1);
+      yield* TestClock.adjust(19_999);
+      yield* settle;
+      expect(view(pendings.at(-1))).toEqual(["reflecting:r1"]);
+
+      yield* TestClock.adjust(1); // 20 秒: 時間切れ。発言は順番待ちの先頭へ戻る
+      yield* settleUntil(() => view(pendings.at(-1))?.[0] === "queued:r1");
+      expect(calls).toHaveLength(1); // 次の呼び出しは再試行の間隔（1 秒）の後
+      expect(pendings.every((f) => f.remarks.length === 1)).toBe(true); // 失敗の回でも項目は外れない
+      expect(pendings.some((f) => f.remarks.some((r) => r.state === "failed"))).toBe(false);
+
+      yield* TestClock.adjust(1_000);
+      yield* settleUntil(() => calls.length === 2);
+      yield* sink.flush;
+      yield* settleUntil(() => pendings.at(-1)?.remarks.length === 0);
+      expect(calls[1]!.fresh.map((r) => r.id)).toEqual(["r1"]);
+      expect(views(pendings).filter((v) => v?.length === 0)).toHaveLength(1); // 空は反映の後の 1 回だけ
+      expect(views(pendings).at(-2)).toEqual(["reflecting:r1"]);
+      expectNoRepeats(pendings);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("応答の失敗が続いて外した発言は、外した回に failed として出る。外す前は queued のまま残り、failed は出ない", () => {
+    const { calls, updaterLayer } = makeScriptedUpdater(["invalid", "invalid", "invalid", "invalid"]);
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, pendings } = yield* openRecordingSink();
+      yield* finalWith(sink, 1, 2, "ひとつめ");
+      const runTo = Effect.fnUntraced(function* (n: number) {
+        for (let i = 0; i < 40 && calls.length < n; i++) {
+          yield* TestClock.adjust(1_000);
+          yield* settle;
+        }
+      });
+      yield* settleUntil(() => calls.length === 1);
+      yield* runTo(3);
+      yield* settle;
+      expect(calls).toHaveLength(3);
+      expect(pendings.length).toBeGreaterThan(0);
+      expect(pendings.every((f) => f.remarks.length === 1 && f.remarks[0]!.state !== "failed")).toBe(true);
+      expect(view(pendings.at(-1))).toEqual(["queued:r1"]);
+
+      yield* runTo(4); // 4 回目は r1 だけ。それも失敗して外す
+      yield* settleUntil(() => view(pendings.at(-1))?.[0] === "failed:r1");
+      expect(calls).toHaveLength(4);
+      expect(pendings.at(-1)!.remarks[0]).toMatchObject({ id: "r1", text: "ひとつめ", state: "failed" });
+      expectNoRepeats(pendings);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("状態が替わると since はそのときの壁時計になる", () => {
+    const { calls, gate, updaterLayer } = makeScriptedUpdater(["gate"]);
+    return Effect.scoped(Effect.gen(function* () {
+      const release = yield* openGate(gate);
+      const { sink, pendings } = yield* openRecordingSink({ speakerOff: false });
+      yield* TestClock.adjust(500);
+      yield* finalWith(sink, 10, 12, "来週に開催します");
+      yield* settleUntil(() => pendings.length === 1);
+      expect(pendings[0]!.remarks[0]).toMatchObject({ state: "waiting", since: 500 });
+
+      yield* TestClock.adjust(100);
+      yield* sink.speaker(segment(2, 10, 12));
+      yield* sink.speaker(settledAt(12));
+      yield* settleUntil(() => calls.length === 1);
+      yield* settle;
+      expect(pendings.at(-1)!.remarks[0]).toMatchObject({ state: "reflecting", since: 600 });
+      yield* Deferred.succeed(release, undefined);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+});
+
+// map-update-latency 6.3: 区切り（segment-end）で仮の項目（closing）を出し、確定で同じ項目が替わる。確定が来なければ 3 秒で、取り込めなかった項目は 5 秒で外す。
+// 期限は外側の Fiber が持つ（TestClock を進めると、発言の出入りが無くてもフレームが出る）
+describe("SessionSink: 区切りの知らせの仮の項目（map-update-latency 6.3）", () => {
+  type UpdateStep = "ok" | "gate" | "invalid";
+  const makeScriptedUpdater = (steps: readonly UpdateStep[]) => {
+    const calls: DiffInput[] = [];
+    const gate: { current: Deferred.Deferred<void> | null } = { current: null };
+    const updaterLayer = Layer.succeed(DiffUpdater, DiffUpdater.of({
+      update: (input) => Effect.gen(function* () {
+        calls.push(input);
+        const step = steps[calls.length - 1] ?? "ok";
+        if (step === "gate" && gate.current !== null) yield* Deferred.await(gate.current);
+        if (step === "invalid") return yield* Effect.fail({ _tag: "DiffOutputInvalid", message: "出力が不正" });
+        return { ops: [] };
+      }),
+    }));
+    return { calls, gate, updaterLayer };
+  };
+  const view = (frame: PendingRemarksFrame | undefined) => frame?.remarks.map((r) => `${r.state}:${r.key}`);
+  const views = (frames: readonly PendingRemarksFrame[]) => frames.map(view);
+  const partial = (track: "相手" | "自分", start: number, end: number, text: string, duplicate = false) => ({ track, start, end, text, duplicate });
+  const segmentSpeaker = (slot: number, start: number, end: number) => ({ type: "speaker", track: "相手", start, end, slot, final: true }) as const;
+  const settledAt = (to: number) => ({ type: "speaker-settled", track: "相手", to }) as const;
+
+  it.effect("区切りが届くと、同じ区間の最後の途中結果の本文で closing の項目がすぐ出る。確定結果が来ると同じ項目が替わり、反映の後に closing は戻らない", () => {
+    const { calls, gate, updaterLayer } = makeScriptedUpdater(["gate"]);
+    return Effect.scoped(Effect.gen(function* () {
+      const release = yield* Effect.map(Deferred.make<void>(), (made) => { gate.current = made; return made; });
+      const { sink, pendings } = yield* openRecordingSink();
+      yield* sink.partial(partial("相手", 5, 6, "来週"));
+      yield* sink.partial(partial("相手", 5, 6.5, "来週の"));
+      yield* settle;
+      expect(pendings).toEqual([]); // 途中結果だけでは項目は出ない
+
+      yield* sink.segmentEnd({ track: "相手", start: 5, end: 7 });
+      yield* settleUntil(() => pendings.length === 1);
+      expect(views(pendings)).toEqual([["closing:相手:5"]]);
+      expect(pendings[0]!.remarks[0]).toMatchObject({ track: "相手", text: "来週の", start: 5, end: 7, state: "closing" });
+
+      yield* sink.final({ track: "相手", start: 5, end: 7, text: "来週の会議" });
+      yield* settleUntil(() => calls.length === 1);
+      yield* settle;
+      expect(views(pendings)[0]).toEqual(["closing:相手:5"]);
+      expect(view(pendings.at(-1))).toEqual(["reflecting:r1"]);
+      expect(pendings.every((f) => f.remarks.length === 1)).toBe(true); // 2 件が並ぶフレームは無い
+      expect(views(pendings).slice(1).flat().some((v) => v?.startsWith("closing:"))).toBe(false); // 確定の後に closing は戻らない
+      expect(pendings.at(-1)!.remarks[0]).toMatchObject({ id: "r1", text: "来週の会議", state: "reflecting" });
+      const shown = pendings.length;
+
+      yield* Deferred.succeed(release, undefined);
+      yield* sink.flush;
+      yield* settleUntil(() => pendings.at(-1)?.remarks.length === 0);
+      expect(view(pendings.at(-1))).toEqual([]);
+      expect(pendings).toHaveLength(shown + 1);
+
+      yield* TestClock.adjust(10_000); // 仮の項目の期限が過ぎても、反映した項目が戻ることはない
+      yield* settle;
+      expect(pendings).toHaveLength(shown + 1);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("確定結果が保留（話者待ち）に入るときも、closing は waiting に替わり、話者がそろって保留を出ても closing は戻らない", () => {
+    const { calls, gate, updaterLayer } = makeScriptedUpdater(["gate"]);
+    return Effect.scoped(Effect.gen(function* () {
+      const release = yield* Effect.map(Deferred.make<void>(), (made) => { gate.current = made; return made; });
+      const { sink, pendings } = yield* openRecordingSink({ speakerOff: false });
+      yield* sink.partial(partial("相手", 5, 6.5, "来週の"));
+      yield* sink.segmentEnd({ track: "相手", start: 5, end: 7 });
+      yield* settleUntil(() => pendings.length === 1);
+      expect(views(pendings)).toEqual([["closing:相手:5"]]);
+
+      yield* sink.final({ track: "相手", start: 5, end: 7, text: "来週の会議" });
+      yield* settleUntil(() => pendings.length === 2);
+      expect(views(pendings)).toEqual([["closing:相手:5"], ["waiting:相手:5"]]);
+
+      yield* sink.speaker(segmentSpeaker(2, 5, 7));
+      yield* sink.speaker(settledAt(7));
+      yield* settleUntil(() => calls.length === 1);
+      yield* settle;
+      yield* TestClock.adjust(10_000);
+      yield* settle;
+      expect(pendings.every((f) => f.remarks.length === 1)).toBe(true);
+      expect(views(pendings).slice(1).flat().some((v) => v?.startsWith("closing:"))).toBe(false);
+      expect(view(pendings.at(-1))).toEqual(["reflecting:r1"]);
+      yield* Deferred.succeed(release, undefined);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("別の区間・別のトラック・重複の印つきの途中結果は仮の本文にならず、本文なしの closing になる", () => {
+    const { updaterLayer } = makeScriptedUpdater([]);
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, pendings } = yield* openRecordingSink();
+      yield* sink.partial(partial("相手", 4, 5.5, "むかしの区間")); // 音声の時刻が 1 秒以上進むと発言になるので、収める
+      yield* sink.partial(partial("自分", 5, 5.8, "自分の声"));
+      yield* sink.segmentEnd({ track: "相手", start: 5, end: 7 });
+      yield* settleUntil(() => pendings.length === 1);
+      expect(views(pendings)).toEqual([["closing:相手:5"]]);
+      expect(pendings[0]!.remarks[0]!.text).toBe("");
+
+      yield* sink.partial(partial("相手", 6, 6.4, "もれた声", true));
+      yield* sink.segmentEnd({ track: "相手", start: 6, end: 7 });
+      yield* settleUntil(() => pendings.length === 2);
+      expect(views(pendings).at(-1)).toEqual(["closing:相手:5", "closing:相手:6"]);
+      expect(pendings.at(-1)!.remarks.map((r) => r.text)).toEqual(["", ""]);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("確定結果が来ない closing は、区切りから 3 秒で外れる（2999 ms では残り、3000 ms で空のフレームが出る）", () => {
+    const { updaterLayer } = makeScriptedUpdater([]);
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, pendings } = yield* openRecordingSink();
+      yield* sink.partial(partial("相手", 5, 6, "来週の"));
+      yield* sink.segmentEnd({ track: "相手", start: 5, end: 7 });
+      yield* settleUntil(() => pendings.length === 1);
+
+      yield* TestClock.adjust(2999);
+      yield* settle;
+      expect(views(pendings)).toEqual([["closing:相手:5"]]);
+
+      yield* TestClock.adjust(1);
+      yield* settleUntil(() => pendings.length === 2);
+      expect(views(pendings)).toEqual([["closing:相手:5"], []]);
+
+      yield* TestClock.adjust(10_000); // 外れたあとに戻らず、空 → 空も出ない
+      yield* settle;
+      expect(pendings).toHaveLength(2);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("期限は区切りごとに数える。後の区切りの closing は、先の区切りの期限では外れない", () => {
+    const { updaterLayer } = makeScriptedUpdater([]);
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, pendings } = yield* openRecordingSink();
+      yield* sink.segmentEnd({ track: "相手", start: 1, end: 2 });
+      yield* settleUntil(() => pendings.length === 1);
+      yield* TestClock.adjust(2000);
+      yield* sink.segmentEnd({ track: "相手", start: 5, end: 6 });
+      yield* settleUntil(() => pendings.length === 2);
+      expect(views(pendings).at(-1)).toEqual(["closing:相手:1", "closing:相手:5"]);
+
+      yield* TestClock.adjust(1000); // 先の区切りから 3 秒
+      yield* settleUntil(() => pendings.length === 3);
+      expect(views(pendings).at(-1)).toEqual(["closing:相手:5"]);
+
+      yield* TestClock.adjust(2000); // 後の区切りから 3 秒
+      yield* settleUntil(() => pendings.length === 4);
+      expect(views(pendings).at(-1)).toEqual([]);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("取り込めなかった発言の failed は 5 秒出して外れ（4999 ms では残る）、あとの発言のフレームにも戻らない", () => {
+    const { calls, updaterLayer } = makeScriptedUpdater(["invalid", "invalid", "invalid", "invalid"]);
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, pendings } = yield* openRecordingSink();
+      yield* sink.final({ track: "相手", start: 1, end: 2, text: "ひとつめ" });
+      for (let i = 0; i < 40 && calls.length < 4; i++) {
+        yield* TestClock.adjust(1_000);
+        yield* settle;
+      }
+      yield* settleUntil(() => view(pendings.at(-1))?.[0] === "failed:r1");
+      expect(calls).toHaveLength(4);
+      const shown = pendings.length;
+
+      yield* TestClock.adjust(4999);
+      yield* settle;
+      expect(pendings).toHaveLength(shown);
+      expect(view(pendings.at(-1))).toEqual(["failed:r1"]);
+
+      yield* TestClock.adjust(1);
+      yield* settleUntil(() => pendings.length === shown + 1);
+      expect(view(pendings.at(-1))).toEqual([]);
+
+      yield* sink.final({ track: "相手", start: 3, end: 4, text: "ふたつめ" }); // 外れたあとの発言の出入りで、failed が戻らない
+      yield* sink.flush;
+      yield* settleUntil(() => pendings.at(-1)?.remarks.length === 0 && pendings.length > shown + 1);
+      expect(views(pendings).slice(shown).flat().some((v) => v?.startsWith("failed:"))).toBe(false);
+      expect(views(pendings).slice(shown).flat().some((v) => v?.endsWith(":r1"))).toBe(false);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("区切りの後の確定結果が中身なしだと、3 秒を待たず closing がすぐ外れる", () => {
+    const { calls, updaterLayer } = makeScriptedUpdater([]);
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, pendings } = yield* openRecordingSink();
+      yield* sink.partial(partial("相手", 5, 6, "あ"));
+      yield* sink.segmentEnd({ track: "相手", start: 5, end: 7 });
+      yield* settleUntil(() => pendings.length === 1);
+      expect(views(pendings)).toEqual([["closing:相手:5"]]);
+
+      yield* sink.final({ track: "相手", start: 5, end: 7, text: "。" });
+      yield* settleUntil(() => pendings.length === 2);
+      expect(views(pendings)).toEqual([["closing:相手:5"], []]);
+      expect(calls).toHaveLength(0); // 中身なしは差分更新に渡らない
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("区切りの後の確定結果が重複の印つきだと、3 秒を待たず closing がすぐ外れる", () => {
+    const { calls, updaterLayer } = makeScriptedUpdater([]);
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, pendings } = yield* openRecordingSink();
+      yield* sink.segmentEnd({ track: "相手", start: 5, end: 7 });
+      yield* settleUntil(() => pendings.length === 1);
+
+      yield* sink.final({ track: "相手", start: 5, end: 7, text: "来週の会議", duplicate: true });
+      yield* settleUntil(() => pendings.length === 2);
+      expect(views(pendings)).toEqual([["closing:相手:5"], []]);
+      expect(calls).toHaveLength(0);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+});
+
+// map-update-latency 6.4: 各発言の行に、その発言の項目（closing・waiting を含む）が最初に入ったフレームを送った壁時計（shownAt）を残す。
+// 行を書いた時刻でも、反映された時刻でもない。セッションの終わりには空のフレームを送り、後からつないだクライアントに古い項目が残らないようにする
+describe("SessionSink: 取り込み待ちに表示した時刻の記録（map-update-latency 6.4）", () => {
+  const remarkRows = (dir: string) => logEvents(dir).filter((e) => e.type === "remark");
+  const gated = Effect.fnUntraced(function* () {
+    const recording = makeRecordingUpdater();
+    recording.updateGate.gate = yield* Deferred.make<void>(); // 差分更新は返らない（反映前のまま）
+    return { ...recording, release: recording.updateGate.gate };
+  });
+  const segment = (slot: number, start: number, end: number) => ({ type: "speaker", track: "相手", start, end, slot, final: true }) as const;
+  const settledAt = (to: number) => ({ type: "speaker-settled", track: "相手", to }) as const;
+
+  it.effect("区切りで closing が出ていた発言の行は、確定結果が来た時刻ではなく、closing のフレームを送った時刻を shownAt に持つ", () => {
+    const { calls, updaterLayer, release } = Effect.runSync(gated());
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, dir, pendings } = yield* openRecordingSink();
+      yield* TestClock.adjust(1000);
+      yield* sink.segmentEnd({ track: "相手", start: 5, end: 7 });
+      yield* settleUntil(() => pendings.length === 1);
+      expect(pendings[0]!.remarks[0]).toMatchObject({ state: "closing", since: 1000 });
+
+      yield* TestClock.adjust(500);
+      yield* sink.final({ track: "相手", start: 5, end: 7, text: "来週の会議" });
+      yield* settleUntil(() => calls.length === 1);
+
+      const rows = remarkRows(dir);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].shownAt).toBe(1000);
+      yield* Deferred.succeed(release, undefined);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("話者待ち（waiting）に入っていた発言の行は、waiting のフレームを送った時刻を shownAt に持つ。話者がそろって出た時刻ではない", () => {
+    const { calls, updaterLayer, release } = Effect.runSync(gated());
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, dir, pendings } = yield* openRecordingSink({ speakerOff: false });
+      yield* TestClock.adjust(500);
+      yield* sink.final({ track: "相手", start: 10, end: 12, text: "来週に開催します" });
+      yield* settleUntil(() => pendings.length === 1);
+      expect(pendings[0]!.remarks[0]).toMatchObject({ state: "waiting", since: 500 });
+
+      yield* TestClock.adjust(100);
+      yield* sink.speaker(segment(2, 10, 12));
+      yield* sink.speaker(settledAt(12));
+      yield* settleUntil(() => calls.length === 1);
+
+      const rows = remarkRows(dir);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].shownAt).toBe(500);
+      yield* Deferred.succeed(release, undefined);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("closing も waiting も経ない発言の行は、その発言が最初に取り込み待ちのフレームに入った時刻を shownAt に持ち、発言ごとに別の値になる。フレームの since と一致する", () => {
+    const { calls, updaterLayer, release } = Effect.runSync(gated());
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, dir, pendings } = yield* openRecordingSink();
+      yield* TestClock.adjust(700);
+      yield* sink.final({ track: "相手", start: 1, end: 2, text: "ひとつめの発言" });
+      yield* settleUntil(() => calls.length === 1);
+      yield* TestClock.adjust(200);
+      yield* sink.final({ track: "相手", start: 3, end: 4, text: "ふたつめの発言" });
+      yield* settleUntil(() => remarkRows(dir).length === 2);
+
+      expect(remarkRows(dir).map((row) => [row.remark.id, row.shownAt])).toEqual([["r1", 700], ["r2", 900]]);
+      const sinceOf = (start: number) => pendings.flatMap((f) => f.remarks).find((r) => r.start === start)?.since;
+      expect([sinceOf(1), sinceOf(3)]).toEqual([700, 900]); // 最初のフレームの since と同じ時刻
+      yield* Deferred.succeed(release, undefined);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("取り込み待ちに出ない発言（中身なし・重複の印つき）の行には shownAt が付かない", () => {
+    const { updaterLayer } = makeRecordingUpdater();
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, dir } = yield* openRecordingSink();
+      yield* TestClock.adjust(300);
+      yield* sink.final({ track: "相手", start: 1, end: 2, text: "。" });
+      yield* sink.final({ track: "相手", start: 3, end: 4, text: "来週の会議", duplicate: true });
+      yield* sink.drain;
+      yield* sink.flush;
+
+      const rows = remarkRows(dir);
+      expect(rows).toHaveLength(2);
+      expect(rows.map((row) => "shownAt" in row)).toEqual([false, false]);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  // map-update-latency 7.1: settledAt は話者待ちから出た壁時計。waiting に入った時刻（shownAt）でも、行を書いた時刻でもない
+  it.effect("話者待ちに入っていた発言の行は、話者がそろって出た時刻を settledAt に持つ。shownAt（waiting に入った時刻）とは別の値になる", () => {
+    const { calls, updaterLayer, release } = Effect.runSync(gated());
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, dir, pendings } = yield* openRecordingSink({ speakerOff: false });
+      yield* TestClock.adjust(500);
+      yield* sink.final({ track: "相手", start: 10, end: 12, text: "来週に開催します" });
+      yield* settleUntil(() => pendings.length === 1);
+
+      yield* TestClock.adjust(100);
+      yield* sink.speaker(segment(2, 10, 12));
+      yield* sink.speaker(settledAt(12));
+      yield* settleUntil(() => calls.length === 1);
+
+      const rows = remarkRows(dir);
+      expect(rows).toHaveLength(1);
+      expect([rows[0].shownAt, rows[0].settledAt]).toEqual([500, 600]);
+      yield* Deferred.succeed(release, undefined);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("話者待ちを経ない発言は、その発言を受け付けた時刻を settledAt に持つ。中身なし・重複の印つきの行にも settledAt は付く", () => {
+    const { updaterLayer } = makeRecordingUpdater();
+    return Effect.scoped(Effect.gen(function* () {
+      const { sink, dir } = yield* openRecordingSink();
+      yield* TestClock.adjust(300);
+      yield* sink.final({ track: "相手", start: 1, end: 2, text: "。" });
+      yield* TestClock.adjust(50);
+      yield* sink.final({ track: "相手", start: 3, end: 4, text: "来週の会議", duplicate: true });
+      yield* sink.drain;
+      yield* sink.flush;
+
+      expect(remarkRows(dir).map((row) => row.settledAt)).toEqual([300, 350]);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("取り込み待ちのフレームを送らない構成（pendingRemarks なし）でも、発言の行は今までどおり書かれ、shownAt は付かない", () => {
+    const { updaterLayer } = makeRecordingUpdater();
+    return Effect.scoped(Effect.gen(function* () {
+      const sessionsDir = yield* withTmpSessionsDir();
+      const sinks = yield* SessionSinks;
+      const dir = yield* sinks.createDir(sessionsDir);
+      const sink = yield* sinks.open({ diffUpdate: () => Effect.void, updaterLayer: yield* sinks.prepare(defaultClaude), model: defaultClaude, dir, title: "週次", publish: () => Effect.void, speak: () => Effect.void, speakerNames: () => Effect.void });
+      yield* sink.speaker(SPEAKER_OFF);
+      yield* sink.final({ track: "相手", start: 1, end: 2, text: "発言です" });
+      yield* sink.flush;
+
+      expect(remarkRows(dir).map((row) => [row.remark.id, "shownAt" in row])).toEqual([["r1", false]]);
+    })).pipe(Effect.provide(sinksLayer({ updaterLayer })));
+  });
+
+  it.effect("セッションの Scope を閉じると、取り込み待ちに項目が残っていても空のフレームを送る（後からつないだクライアントに古い項目を残さない）", () => {
+    const { calls, updaterLayer } = Effect.runSync(gated());
+    return Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      const { sink, pendings } = yield* Scope.provide(openRecordingSink(), scope);
+      yield* sink.final({ track: "相手", start: 1, end: 2, text: "反映中の発言" });
+      yield* settleUntil(() => calls.length === 1);
+      expect(pendings.at(-1)!.remarks.map((r) => r.state)).toEqual(["reflecting"]);
+
+      yield* Scope.close(scope, Exit.void);
+      yield* settle;
+
+      expect(pendings.at(-1)).toEqual({ type: "pending-remarks", remarks: [] });
+    }).pipe(Effect.provide(sinksLayer({ updaterLayer })));
   });
 });

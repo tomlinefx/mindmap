@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Deferred, Effect, Layer } from "effect";
+import { TestClock } from "effect/testing";
 import { restoreSession, type DiffUpdater, type SessionLog, type DiffInput, type DiffOutput, type LogEvent, type Op, type Remark } from "../src/core/index.ts";
 import { collectLog, settleUntil, updaterLayer } from "./fixtures/sessionLayers.ts";
 
@@ -119,7 +120,7 @@ describe("invConservation: 部分反映", () => {
     expect(calls.map((c) => ids(c.fresh))).toEqual([["r1", "r2"], ["r3"]]);
   }));
 
-  it.effect("部分成功の次の通常失敗はその入力を全件消費し、後続へ進む（C05）", () => Effect.gen(function* () {
+  it.effect("部分成功の次の通常失敗は、その入力を処理済みにせず順番待ちへ戻す。flush は待たずに戻り、反映済みの分は残る（C05）", () => Effect.gen(function* () {
     const calls: DiffInput[] = [];
     const events: LogEvent[] = [];
     const session = yield* restoreSession([
@@ -132,17 +133,13 @@ describe("invConservation: 部分反映", () => {
     )));
     yield* session.flush;
     expect(calls.map((c) => ids(c.fresh))).toEqual([["r1", "r2", "r3"], ["r2", "r3"]]);
-    expect(yield* session.unreflectedRemarks).toEqual([]);
-    expect(events.filter((e) => e.type === "diff")[1]).toMatchObject({ ops: [], error: expect.stringContaining("合成の通信失敗") });
+    expect(ids(yield* session.unreflectedRemarks)).toEqual(["r2", "r3"]);
+    expect(events.filter((e) => e.type === "diff")[1]).toMatchObject({ ops: [], error: expect.stringContaining("合成の通信失敗"), requeued: true });
     expect((yield* session.snapshot).nodes.filter((n) => n.kind === "議題").map((n) => n.evidence)).toEqual([["r1"]]);
-    yield* session.push(remark(4));
-    yield* session.flush;
-    expect(ids(calls[2]!.fresh)).toEqual(["r4"]);
-    expect(ids(calls[2]!.recent)).toEqual(["r1", "r2", "r3"]);
   }));
 
   for (const count of [0, -1, 0.5, 3]) {
-    it.effect(`不正な反映数${count}は通常失敗として全件消費し、操作を反映しない`, () => Effect.gen(function* () {
+    it.effect(`不正な反映数${count}は通常失敗として、操作を反映せず入力を順番待ちへ戻し、待った後に新しい発言と一緒に呼び直す`, () => Effect.gen(function* () {
       const calls: DiffInput[] = [];
       const events: LogEvent[] = [];
       const session = yield* openHeld([1], Layer.merge(
@@ -155,11 +152,13 @@ describe("invConservation: 部分反映", () => {
       yield* session.idle;
       expect(calls).toHaveLength(1);
       expect((yield* session.snapshot).nodes.filter((n) => n.kind === "議題")).toEqual([]);
-      expect(yield* session.unreflectedRemarks).toEqual([]);
-      expect(events.find((e) => e.type === "diff")).toMatchObject({ ops: [], error: expect.any(String) });
+      expect(ids(yield* session.unreflectedRemarks)).toEqual(["r1", "r2"]);
+      expect(events.find((e) => e.type === "diff")).toMatchObject({ ops: [], error: expect.any(String), requeued: true });
       yield* session.push(remark(3));
-      yield* session.flush;
-      expect(ids(calls[1]!.fresh)).toEqual(["r3"]);
+      yield* TestClock.adjust(1_000);
+      yield* settleUntil(() => calls.length >= 2);
+      yield* session.idle;
+      expect(calls.map((c) => ids(c.fresh))).toEqual([["r1", "r2"], ["r1", "r2", "r3"], ["r2", "r3"], ["r3"]]);
     }));
   }
 });

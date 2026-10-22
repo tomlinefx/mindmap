@@ -33,6 +33,7 @@ describe("初期値", () => {
       local: false,
       selfPaused: false,
       speakerNames: {},
+      pendingRemarks: Option.none(),
     } satisfies Model);
   });
 });
@@ -227,6 +228,7 @@ describe("つないだときの値（server が、つないだら保持してい
           local: true,
           selfPaused: false,
           speakerNames: {},
+          pendingRemarks: Option.none(),
         } satisfies Model);
       }),
     );

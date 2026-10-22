@@ -16,6 +16,7 @@ import { ReviewBuild } from "../src/review.ts";
 import { runCli } from "../src/cli.ts";
 import { type DiffInput, type Op } from "../src/core/index.ts";
 import { fakeListener } from "./fakeListener.ts";
+import { dataRows, isUnmeasured, rowOf } from "./fixtures/latencyTable.ts";
 
 const external = vi.hoisted(() => ({ openClaudeUpdater: vi.fn(), openListener: vi.fn() }));
 vi.mock("../src/claude.ts", async () => (await import("./fixtures/claudeModule.ts")).fakeClaudeModule(() => external.openClaudeUpdater()));
@@ -278,7 +279,7 @@ describe("CLI の Effect 境界", () => {
     expect(deps.stdout).toEqual([]);
   }));
 
-  it.effect("失敗した更新は記録して公開せず、次の成功と最終の書き出しまで updater を保持する", () => Effect.gen(function* () {
+  it.effect("失敗した更新は記録して公開せず、最終の書き出しまで updater を保持する。失敗した回の待ち時間は待たない", () => Effect.gen(function* () {
     const dir = yield* directory;
     const deps = dependencies(dir);
     const close = vi.fn(() => { expect(deps.stdout.join("")).not.toBe(""); });
@@ -293,8 +294,9 @@ describe("CLI の Effect 境界", () => {
     external.openListener.mockImplementation(open);
     yield* runCli(["play", fixture]).pipe(Effect.provide(deps.layer));
 
-    expect(update).toHaveBeenCalledTimes(3);
-    expect(published.map((snapshot) => snapshot.round)).toEqual([0, 1, 2]);
+    // 失敗した回の発言は順番待ちの頭へ戻り、再生の終わり（flush）は再試行の間隔を待たずに戻る
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(published.map((snapshot) => snapshot.round)).toEqual([0]);
     expect(close).toHaveBeenCalledTimes(1);
     const log = readFileSync(join(deps.stdout.join("").split("\n")[0]!, "..", "log.jsonl"), "utf8");
     expect(log).toContain("更新に失敗");
@@ -332,5 +334,65 @@ describe("CLI の Effect 境界", () => {
     yield* TestClock.adjust(8800);
     yield* Fiber.join(fiber);
     expect(calls).toEqual([["r1"], ["r2"], ["r3"]]);
+  }));
+
+  it.effect("realtime の再生は、再生の開始の壁時計を origin の行として最初の発言の前に 1 行だけ残し、latency が同じ形の表を出す", () => Effect.gen(function* () {
+    const dir = yield* directory;
+    const deps = dependencies(dir);
+    const root = yield* Deferred.make<void>();
+    external.openListener.mockImplementation(fakeListener((snapshot) => {
+      if (snapshot.round === 0) Deferred.doneUnsafe(root, Effect.void);
+    }).open);
+    const pending: number[] = [];
+    const tracked = yield* TestClock.testClockWith((testClock) => Effect.succeed(trackedClock(testClock, pending)));
+    const before = Date.now();
+    const fiber = yield* runCli(["play", fixture, "--realtime"]).pipe(Effect.provide(deps.layer), Effect.provideService(Clock.Clock, tracked), Effect.forkChild);
+    yield* Deferred.await(root);
+    yield* sleepsRegistered(pending, [9800]);
+    yield* TestClock.adjust(9800);
+    yield* sleepsRegistered(pending, [9400]);
+    yield* TestClock.adjust(9400);
+    yield* sleepsRegistered(pending, [8800]);
+    yield* TestClock.adjust(8800);
+    yield* Fiber.join(fiber);
+    const after = Date.now();
+
+    const session = join(deps.stdout.join("").split("\n")[0]!, "..");
+    const log = readFileSync(join(session, "log.jsonl"), "utf8").split("\n").filter((l) => l.trim() !== "").map((l) => JSON.parse(l) as { type: string; wallTime?: unknown });
+    const origins = log.filter((row) => row.type === "origin");
+    expect(origins).toHaveLength(1);
+    // 壁時計は実時間（TestClock の時刻ではない）。最初の発言より前に書く
+    expect(origins[0]!.wallTime).toEqual(expect.any(Number));
+    expect(origins[0]!.wallTime as number).toBeGreaterThanOrEqual(before);
+    expect(origins[0]!.wallTime as number).toBeLessThanOrEqual(after);
+    expect(log.findIndex((row) => row.type === "origin")).toBeLessThan(log.findIndex((row) => row.type === "remark"));
+
+    deps.stdout.length = 0;
+    yield* runCli(["latency", session]).pipe(Effect.provide(deps.layer));
+
+    const out = deps.stdout.join("");
+    expect(dataRows(out)).toHaveLength(12);
+    // 流し直しは settling・取り込み待ちを通らないので、表示・締まり・話者待ちは計測なし。反映・呼び出し待ち・呼び出しには標本がある
+    const samples = (track: "自分" | "相手", interval: "applied" | "callWait" | "call") => Number(rowOf(out, track, interval)[2]) || 0; // 標本が無いトラックの件数は計測なし
+    const count = (interval: "applied" | "callWait" | "call") => samples("自分", interval) + samples("相手", interval);
+    for (const track of ["自分", "相手"] as const) {
+      for (const interval of ["shown", "settled", "speakerWait"] as const) expect(isUnmeasured(rowOf(out, track, interval)), `${track} ${interval}`).toBe(true);
+    }
+    for (const interval of ["applied", "callWait", "call"] as const) expect(count(interval), interval).toBeGreaterThanOrEqual(1);
+  }));
+
+  it.effect("realtime でない再生は origin の行を残さず、latency はすべて計測なしと表示する", () => Effect.gen(function* () {
+    const dir = yield* directory;
+    const deps = dependencies(dir);
+    yield* runCli(["play", fixture]).pipe(Effect.provide(deps.layer));
+    const session = join(deps.stdout.join("").split("\n")[0]!, "..");
+
+    expect(readFileSync(join(session, "log.jsonl"), "utf8")).not.toContain('"type":"origin"');
+    deps.stdout.length = 0;
+    yield* runCli(["latency", session]).pipe(Effect.provide(deps.layer));
+
+    const out = deps.stdout.join("");
+    expect(dataRows(out)).toHaveLength(12);
+    for (const cells of dataRows(out)) expect(isUnmeasured(cells), cells.join("|")).toBe(true);
   }));
 });

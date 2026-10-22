@@ -34,6 +34,7 @@ export function fakeListener(onPublish: (snapshot: Snapshot) => void = () => {})
         selfPause: () => Effect.void,
         sessionMode: (frame) => Effect.sync(() => { modes.push(frame); }),
         speakerNames: () => Effect.void,
+        pendingRemarks: () => Effect.void,
         connect: () => Effect.void,
         drained: Effect.sync(() => { events.push("drained"); }),
       });

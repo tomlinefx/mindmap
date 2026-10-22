@@ -205,7 +205,7 @@ describe("ログからの復元", () => {
     }));
 
   // 遅れの時刻と印・origin の行を持たない古いログと、持つ新しいログの、どちらも同じマップ・書き出し・未反映の発言に復元される
-  // （requeued を読む復元は別のタスク。ここでは今の復元が新しい項目を無視して壊れないことだけを見る）
+  // （requeued の行の発言が取り込み待ちへ戻ることは diffRecovery.test.ts で見る。ここでは、後の回で反映し直した発言なら、印の有無で状態が変わらないことを見る）
   it.effect("settledAt・shownAt・requeued・isolated・origin の行を含むログも、含まない古いログと同じ状態に復元される", () =>
     Effect.gen(function* () {
       const { events } = yield* original();
@@ -222,7 +222,7 @@ describe("ログからの復元", () => {
       ];
       expect(marked.some((line) => "settledAt" in (line as object))).toBe(true);
       expect(marked.some((line) => "isolated" in (line as object))).toBe(true);
-      // error の無い diff にも requeued を付けて、印があっても反映済みとして読むことを見る
+      // 失敗した diff の行に requeued を付ける（その発言は後の回で反映し直されるので、状態は変わらない）
       const failedDiff = marked.findIndex((line) => (line as { error?: string }).error !== undefined);
       expect(failedDiff).toBeGreaterThan(0);
       marked[failedDiff] = { ...(marked[failedDiff] as object), requeued: true };
@@ -637,6 +637,9 @@ describe("共有画面の復元（復元はファイル名だけを戻し、画�
       const events = [...logged]; // 続きを入れる前までのログ
       const next = [spoken("a3", 200)];
       for (const r of next) yield* session.push(r);
+      // 失敗した回（call 2）の発言は、待ち時間の後に、新しい発言と一緒に呼び直される
+      yield* TestClock.adjust(1_000);
+      yield* settleUntil(() => live.calls.length === 3);
       yield* session.idle;
       const expected = live.calls[2]!;
       // 元のセッションの続きで、3 件添える（F・D・E）と、2 件送り直す（B・C）ことが前提
@@ -652,7 +655,9 @@ describe("共有画面の復元（復元はファイル名だけを戻し、画�
       expect(cont.calls).toHaveLength(1);
       expect(view(cont.calls[0]!.screens)).toEqual(view(expected.screens));
       expect(view(cont.calls[0]!.previousScreens)).toEqual(view(expected.previousScreens));
-      // 画面以外の入力も元と同じ
+      // 失敗した回の発言は、ライブでは順番待ちに戻って続きに載る。ログからの復元も requeued の行を反映済みと読まず、同じ発言が先頭に載る
+      expect(expected.fresh).toHaveLength(next.length + 1);
+      expect(expected.fresh.slice(1)).toEqual(next);
       expect(cont.calls[0]!.fresh).toEqual(expected.fresh);
     }));
 
@@ -717,6 +722,9 @@ describe("共有画面の復元（復元はファイル名だけを戻し、画�
           const logged = [...events];
           const next = [spoken("a2", 200)];
           for (const r of next) yield* session.push(r);
+          // 失敗した回の発言は、待ち時間の後に、新しい発言と一緒に呼び直される
+          yield* TestClock.adjust(1_000);
+          yield* settleUntil(() => calls.length === 2);
           yield* session.idle;
           expect(calls).toHaveLength(2);
           const expected = calls[1]!;
@@ -730,6 +738,8 @@ describe("共有画面の復元（復元はファイル名だけを戻し、画�
           expect(cont.calls).toHaveLength(1);
           expect(view(cont.calls[0]!.screens)).toEqual(view(expected.screens));
           expect(view(cont.calls[0]!.previousScreens)).toEqual(view(expected.previousScreens));
+          // 失敗した回の発言は、ログからの復元でも順番待ちに戻り、ライブと同じ発言が続きに載る（成功した回の発言は載らない）
+          expect(expected.fresh).toHaveLength(kind === "failure" ? next.length + 1 : next.length);
           expect(cont.calls[0]!.fresh).toEqual(expected.fresh);
         }));
     }

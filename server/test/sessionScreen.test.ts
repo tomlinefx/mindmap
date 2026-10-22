@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Layer, Schema } from "effect";
+import { TestClock } from "effect/testing";
 import { DiffEvent, LogEvent, makeSession, ROOT_ID, restoreSession, restoreState, type DiffInput, type DiffOutput, type Remark, type ScreenChange } from "../src/core/index.ts";
 import { gatedScripted } from "./fixtures/batches.ts";
 import { collectLog, forbiddenUpdater, logLayer, settleUntil, updaterLayer, type UpdateFailure } from "./fixtures/sessionLayers.ts";
@@ -43,9 +44,15 @@ const setup = Effect.fn("setup")(function* (options: { images?: boolean; fail?: 
     yield* session.push(remark(end));
     yield* session.idle;
   });
+  // 失敗した回は、待ち時間（最初は 1 秒）の後に、待つ間に届いた発言と一緒に呼び直される
+  const afterBackoff = Effect.fn("afterBackoff")(function* (ms = 1_000) {
+    yield* TestClock.adjust(ms);
+    yield* Effect.forEach(Array.from({ length: 20 }), () => Effect.yieldNow, { discard: true });
+    yield* session.idle;
+  });
   const diffs = () => events.filter((e): e is Extract<LogEvent, { type: "diff" }> => e.type === "diff");
   const screenLines = () => events.filter((e): e is Extract<LogEvent, { type: "screen" }> => e.type === "screen");
-  return { session, calls, events, written, reads, call, diffs, screenLines, block };
+  return { session, calls, events, written, reads, call, afterBackoff, diffs, screenLines, block };
 });
 
 const startsOf = (input: DiffInput) => input.screens?.map((s) => s.start);
@@ -54,17 +61,21 @@ const skippedReason = "差分更新には渡さない（モデルが画像を読
 describe("モデルが画像を読まないセッション（Issue #665）", () => {
   it.effect.each([false, true])("images:false は新規・過去画面を添えず、発言の更新と保存を続ける（初回失敗: %s）", (failFirst) =>
     Effect.gen(function* () {
-      const { session, calls, written, reads, screenLines, call, diffs } = yield* setup({ images: false, fail: (i) => failFirst && i === 0 });
+      const { session, calls, written, reads, screenLines, call, afterBackoff, diffs } = yield* setup({ images: false, fail: (i) => failFirst && i === 0 });
       const first = shot(1, "first");
       const next = shot(10, "next");
       yield* session.pushScreen(first);
       yield* session.pushScreen(none(2));
       yield* call(9);
       yield* session.pushScreen(next);
-      yield* call(19);
+      if (failFirst) {
+        // 失敗した回の発言（9）は待った後、待つ間に届いた発言（19）と一緒に呼び直される
+        yield* session.push(remark(19));
+        yield* afterBackoff();
+      } else yield* call(19);
       yield* call(29);
 
-      expect(calls.map((input) => input.fresh.map((r) => r.end))).toEqual([[9], [19], [29]]);
+      expect(calls.map((input) => input.fresh.map((r) => r.end))).toEqual(failFirst ? [[9], [9, 19], [29]] : [[9], [19], [29]]);
       expect(written.map((w) => w.bytes)).toEqual([first.image!.bytes, next.image!.bytes]);
       expect(screenLines()).toEqual([
         { type: "screen", start: 1, image: written[0]!.file },
@@ -403,17 +414,18 @@ describe("差分更新に添える画面の選び方", () => {
 
   it.effect("差分更新が失敗した回の画面も処理済み（次の呼び出しに再び載せない）。失敗の diff の入力には添えた画面が残る", () =>
     Effect.gen(function* () {
-      const { session, calls, call, diffs } = yield* setup({ fail: (i) => i === 0 });
+      const { session, calls, call, afterBackoff, diffs } = yield* setup({ fail: (i) => i === 0 });
       yield* session.pushScreen(shot(1));
       yield* call(9);
-      yield* call(19);
+      yield* session.push(remark(19));
+      yield* afterBackoff();
       expect(calls).toHaveLength(2);
       expect(diffs()[0]!.error).toBeDefined();
       expect(diffs()[0]!.input.screens).toEqual([{ start: 1, image: "0001.0.jpg" }]);
       expect("screens" in calls[1]!).toBe(false);
     }));
 
-  it.effect("添える画像の読み戻しが defect になっても、update の失敗と同じく処理済みにして次の呼び出しへ進む", () =>
+  it.effect("添える画像の読み戻しが defect になっても、update の失敗と同じく発言を順番待ちへ戻し（画面は処理済み）、待った後の次の呼び出しへ進む", () =>
     Effect.gen(function* () {
       const calls: DiffInput[] = [];
       const events: LogEvent[] = [];
@@ -440,12 +452,16 @@ describe("差分更新に添える画面の選び方", () => {
       expect(diffs()[0]!.error).toMatch(/^defect: /);
       expect(diffs()[0]!.input.fresh).toEqual([r1.id]);
       expect(diffs()[0]!.input.screens).toEqual([{ start: 1, image: "0001.0.jpg" }]);
-      expect(yield* session.unreflectedRemarks).toEqual([]);
+      expect((yield* session.unreflectedRemarks).map((r) => r.id)).toEqual([r1.id]);
       expect(calls).toHaveLength(0);
 
-      yield* session.push(remark(19));
+      const r2 = remark(19);
+      yield* session.push(r2);
+      yield* TestClock.adjust(1_000);
+      yield* settleUntil(() => calls.length === 1);
       yield* session.idle;
       expect(calls).toHaveLength(1);
+      expect(calls[0]!.fresh.map((r) => r.id)).toEqual([r1.id, r2.id]);
       expect("screens" in calls[0]!).toBe(false);
       // 読めなかった画面は「最後に添えた」に数えるが、送り直しからは外し、続きの呼び出しを失敗させない
       expect("previousScreens" in calls[0]!).toBe(false);
@@ -641,12 +657,13 @@ describe("開き直しのために送り直す、最後に添えた 2 件（Diff
 
   it.effect("失敗した呼び出しで選んだ画面も「添えた」ものに数える", () =>
     Effect.gen(function* () {
-      const { session, calls, call } = yield* setup({ fail: (i) => i === 1 });
+      const { session, calls, call, afterBackoff } = yield* setup({ fail: (i) => i === 1 });
       yield* session.pushScreen(shot(1));
       yield* call(9);
       yield* session.pushScreen(shot(11));
       yield* call(19); // 失敗
-      yield* call(29);
+      yield* session.push(remark(29));
+      yield* afterBackoff();
       expect(previousStarts(calls[2]!)).toEqual([1, 11]);
     }));
 

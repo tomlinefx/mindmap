@@ -164,17 +164,21 @@ describe("Claude の利用上限で差分更新を一時停止する（同じ Se
       expect(yield* session.unreflectedRemarks).toEqual([]);
     }));
 
-  it.effect("利用上限ではない失敗は今までどおり処理済みになり、一時停止にも再試行にもならない", () =>
+  it.effect("利用上限ではない失敗は一時停止にならず、発言を順番待ちへ戻して 1 秒後に呼び直す。利用上限の周期（DIFF_UPDATE_RETRY_MS）は使わない", () =>
     Effect.gen(function* () {
       const events: LogEvent[] = [];
       const { session, calls } = yield* openSession(() => failure, events);
 
       yield* session.push(remark(1));
       yield* session.idle;
-      yield* TestClock.adjust(TEN_MINUTES);
-
       expect(calls()).toBe(1);
-      expect(yield* session.unreflectedRemarks).toEqual([]);
+      expect(ids(yield* session.unreflectedRemarks)).toEqual(["r1"]);
+      expect(yield* session.diffUpdate).toEqual({ status: "running" });
+      expect(yield* session.nextRetryAt).toBeUndefined();
+
+      yield* TestClock.adjust(1_000);
+      yield* settleUntil(() => calls() === 2);
+      expect(calls()).toBe(2);
       expect(yield* session.diffUpdate).toEqual({ status: "running" });
       expect(transitions(events)).toEqual([]);
     }));
@@ -268,7 +272,7 @@ describe("Claude の利用上限で止まったログからの復元", () => {
       expect(yield* restored.unreflectedRemarks).toEqual([]);
     }));
 
-  it.effect("再試行が通常の失敗で終わったログ（resumed の行なし）も running で戻り、発言は処理済みになる", () =>
+  it.effect("再試行が通常の失敗で終わったログ（resumed の行なし）も running で戻り、その回の発言は取り込み待ちに戻る", () =>
     Effect.gen(function* () {
       const events: LogEvent[] = [];
       const { session, calls } = yield* openSession((call) => (call === 0 ? rejected(TEN_MINUTES / 1000) : failure), events);
@@ -283,6 +287,7 @@ describe("Claude の利用上限で止まったログからの復元", () => {
       expect((yield* restoreState(rows)).diffUpdate).toEqual({ status: "running" });
       const restored = yield* restoreSession(rows).pipe(Effect.provide(Layer.merge(forbiddenUpdater, silentLog)));
       expect(yield* restored.diffUpdate).toEqual({ status: "running" });
-      expect(yield* restored.unreflectedRemarks).toEqual([]);
+      // 1 回目の通常の失敗は「戻した」回なので、発言は反映済みにならず取り込み待ちに戻る
+      expect((yield* restored.unreflectedRemarks).map((r) => r.id)).toEqual(["r1"]);
     }));
 });

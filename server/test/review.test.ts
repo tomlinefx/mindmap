@@ -135,7 +135,8 @@ describe("reviewSnapshot", () => {
         ...events.map((e) => {
           const type = (e as { type: string }).type;
           if (type === "remark") return { ...(e as object), settledAt: 1760000001000, shownAt: 1760000002000 };
-          if (type === "diff") return { ...(e as object), requeued: true, isolated: true };
+          // requeued の行は processedRemarks が無いと発言を反映済みと数えないので、渡した発言の数を添えて反映済みのままにする
+          if (type === "diff") return { ...(e as object), requeued: true, isolated: true, processedRemarks: (e as { input: { fresh: unknown[] } }).input.fresh.length };
           return e;
         }),
       ];

@@ -3,7 +3,7 @@
 import { Option, Schema } from "effect";
 import type { Update } from "foldkit";
 import { modifyFields } from "foldkit/struct";
-import { DiffUpdateState, SelfPaused, SessionIntakeStatus, Snapshot } from "../../../../server/src/core/index.ts";
+import { DiffUpdateState, PendingRemarksFrame, SelfPaused, SessionIntakeStatus, Snapshot } from "../../../../server/src/core/index.ts";
 import { CaptionState } from "../../captions.ts";
 import { applyCaptionDeadline, applyClose, applyFrame, applyOpen, createFeedState, type FeedState } from "../../liveFeed.ts";
 import { Message } from "./message.ts";
@@ -19,6 +19,8 @@ export const Model = Schema.Struct({
   selfPaused: SelfPaused,
   // 話者の名前の表（ラベル → 名前。Issue #1026）
   speakerNames: Schema.Record(Schema.String, Schema.String),
+  // 取り込み待ちの一覧。空のフレームは None
+  pendingRemarks: Schema.Option(PendingRemarksFrame),
 });
 export type Model = typeof Model.Type;
 
@@ -32,6 +34,7 @@ const toModel = (feed: FeedState): Model => ({
   local: feed.local,
   selfPaused: feed.selfPaused,
   speakerNames: feed.speakerNames,
+  pendingRemarks: Option.fromNullishOr(feed.pendingRemarks),
 });
 
 const toFeed = (model: Model): FeedState => ({
@@ -44,6 +47,7 @@ const toFeed = (model: Model): FeedState => ({
   local: model.local,
   selfPaused: model.selfPaused,
   speakerNames: model.speakerNames,
+  pendingRemarks: Option.getOrNull(model.pendingRemarks),
 });
 
 export const init = (): Model => toModel(createFeedState());
@@ -63,6 +67,7 @@ const apply = (model: Model, step: (feed: FeedState) => FeedState): Return => {
       local: () => next.local,
       selfPaused: () => next.selfPaused,
       speakerNames: () => next.speakerNames,
+      pendingRemarks: () => next.pendingRemarks,
     }),
   };
 };

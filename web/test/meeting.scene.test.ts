@@ -1115,3 +1115,20 @@ describe("会議中の Scene: 話者の名前（Issue #1026）", () => {
     );
   });
 });
+
+describe("会議中の Scene: 取り込み待ちの一覧（map-update-latency 6.5）", () => {
+  const item = { key: "相手:1", track: "相手" as const, text: "予算の話", start: 1, end: 2, state: "queued" as const, since: 0 };
+  const trayTexts = (sim: Sim) => ({ trays: findAll(sim.html, ".pending-tray").length, text: texts(sim.html, ".pending-tray__text"), state: texts(sim.html, ".pending-tray__state") });
+
+  it("pending-remarks の frame を流すと、今の議題の近くの一覧に出て、空の frame で消える（会議中のプログラムの update・view を通す）", () => {
+    meetingScene(init(false),
+      frame(FIRST),
+      settle,
+      tap((sim) => expect(trayTexts(sim).trays).toBe(0)),
+      frame({ type: "pending-remarks", remarks: [item] }),
+      tap((sim) => expect(trayTexts(sim)).toEqual({ trays: 1, text: ["予算の話"], state: ["待ち"] })),
+      frame({ type: "pending-remarks", remarks: [] }),
+      tap((sim) => expect(trayTexts(sim).trays).toBe(0)),
+    );
+  });
+});

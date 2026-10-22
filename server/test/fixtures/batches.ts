@@ -1,6 +1,7 @@
 import { Effect, Layer } from "effect";
+import { TestClock } from "effect/testing";
 import { makeSession, restoreSession, type DiffInput, type DiffOutput, type LogEvent, type Op, type Remark, type Session } from "../../src/core/index.ts";
-import { collectLog, updaterLayer, type UpdateFailure } from "./sessionLayers.ts";
+import { collectLog, settleUntil, updaterLayer, type UpdateFailure } from "./sessionLayers.ts";
 
 // 差分更新は、呼び出し中でなければ発言 1 件ですぐ呼ぶ。複数の発言を 1 回の呼び出しにまとめて渡すのは、
 // 呼び出し中に届いた発言だけ。このファイルは、その「呼び出し中に届かせる」流れをテストの側で作る。
@@ -38,6 +39,15 @@ const openHolding = (title: string, held: readonly Remark[], events: LogEvent[])
   return restoreSession(log);
 };
 
+// 失敗した回の発言は、待ち時間（最大 10 秒）の後に次の組と一緒に呼び直される。failures 回目の失敗の行が書かれ、待ちの予約が済んでから時計を進める
+const waitOutBackoff = Effect.fnUntraced(function* (events: readonly LogEvent[], script: readonly BatchStep[], k: number) {
+  if (Array.isArray(script[k])) return;
+  const failures = script.slice(0, k + 1).filter((step) => !Array.isArray(step)).length;
+  yield* settleUntil(() => events.filter((e) => e.type === "diff" && e.requeued === true).length >= failures);
+  yield* Effect.forEach(Array.from({ length: 20 }), () => Effect.yieldNow, { discard: true });
+  yield* TestClock.adjust(10_000);
+});
+
 // batches の各組を、それぞれ 1 回の差分更新の呼び出しに渡す。台本の i 番目の手が、i 番目の組の呼び出しの応答になる。
 // 組 k の発言は、組 k-1 の呼び出し中に届け、その呼び出しが終わった時点でまとめて渡る。最初の組だけは、最後の 1 件より前の発言を
 // 復元したたまりとして持たせたセッションで開き、最後の 1 件を push して 1 回目の呼び出しにまとめる（呼び出し中になる前の発言は 1 件ずつ呼ばれるため）。
@@ -63,8 +73,10 @@ export const playBatches = Effect.fn("playBatches")(function* (
     const following = batches[k + 1];
     if (following) for (const r of following) yield* session.push(r);
     replies[k]!();
-    if (following) yield* waitForCall(calls, k + 2);
-    else yield* session.idle;
+    if (following) {
+      yield* waitOutBackoff(events, script, k);
+      yield* waitForCall(calls, k + 2);
+    } else yield* session.idle;
     if (options.onApplied) yield* options.onApplied(k, session);
   }
   return { session, calls, events };

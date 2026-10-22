@@ -7,7 +7,7 @@ import { TestClock } from "effect/testing";
 import { DiffUpdater, TAP_NOTICE_TEXT, type HelperPartial, type SettledRemark, type Track } from "../src/core/index.ts";
 import { Helpers, HelperLaunchFailure, type HelperAttempt, type HelperExitInfo } from "../src/helpers.ts";
 import { HelperExited, NoSession, SessionBusy } from "../src/sessionFailure.ts";
-import { SessionSinks, type SessionSink } from "../src/sessionSinks.ts";
+import { SessionSinks, type OpenSessionSink, type SessionSink } from "../src/sessionSinks.ts";
 import { Sessions, SessionsDir, type SessionStart } from "../src/sessions.ts";
 import { Viewers } from "../src/viewers.ts";
 import { UpdaterUnavailable } from "../src/updaterUnavailable.ts";
@@ -126,6 +126,7 @@ type FakeSinksHandle = {
   readonly opened: { count: number; closed: number };
   readonly finals: { id: string; track: Track; text: string }[];
   readonly partials: { track: Track; text: string }[];
+  readonly segmentEnds: { track: Track; start: number; end: number }[]; // sink.segmentEnd へ届いた区切り（届いた順）
   readonly words: { final: unknown[]; partial: unknown[] }; // sink へ届いた発言・途中結果の words（Issue #639。無ければ undefined）
   readonly screens: { start: number; image: Uint8Array | null; lines?: readonly string[] }[];
   readonly screenOffs: { start: number; reason: "指定" | "許可なし" }[];
@@ -136,6 +137,7 @@ type FakeSinksHandle = {
   readonly speakerCalls: string[]; // sink.speaker（speaker:<type>）と sink.speakersRenumbered（renumbered）が呼ばれた順（Issue #1025）
   readonly vocabAdded: string[][]; // addUserVocabulary へ届いた語（呼び出しごと）
   readonly order: string[]; // flush・exports・close が起きた順
+  readonly originWalls: Effect.Effect<number | undefined>[]; // open へ渡された originWall（開いた回ごと）。読むたびにそのときの値が出る
   readonly control: { createDirFails: boolean; finalDiesOn: string | undefined }; // finalDiesOn: この text の remark を final に渡すと defect になる
 };
 
@@ -146,6 +148,7 @@ function makeFakeSessionSinks(options: { exportsFails?: boolean } = {}): Effect.
     const opened = { count: 0, closed: 0 };
     const finals: { id: string; track: Track; text: string }[] = [];
     const partials: { track: Track; text: string }[] = [];
+    const segmentEnds: { track: Track; start: number; end: number }[] = [];
     const words: { final: unknown[]; partial: unknown[] } = { final: [], partial: [] };
     const screens: { start: number; image: Uint8Array | null; lines?: readonly string[] }[] = [];
     const screenOffs: { start: number; reason: "指定" | "許可なし" }[] = [];
@@ -156,16 +159,19 @@ function makeFakeSessionSinks(options: { exportsFails?: boolean } = {}): Effect.
     const vocabAdded: string[][] = [];
     const speakerCalls: string[] = [];
     const order: string[] = [];
+    const originWalls: Effect.Effect<number | undefined>[] = [];
     const control: { createDirFails: boolean; finalDiesOn: string | undefined } = { createDirFails: false, finalDiesOn: undefined };
-    const open = (args: { dir: string }): Effect.Effect<SessionSink, never, Scope.Scope> =>
+    const open = (args: Pick<OpenSessionSink, "dir" | "originWall">): Effect.Effect<SessionSink, never, Scope.Scope> =>
       Effect.gen(function* () {
         opened.count++;
+        if (args.originWall !== undefined) originWalls.push(args.originWall);
         let count = 0;
         yield* Effect.addFinalizer(() => Effect.sync(() => { opened.closed++; order.push("close"); }));
         const sink: SessionSink = {
           dir: args.dir,
           partial: (p: HelperPartial) => Effect.sync(() => { partials.push({ track: p.track, text: p.text }); words.partial.push((p as { words?: unknown }).words); }),
           final: (r: SettledRemark) => Effect.suspend(() => r.text === control.finalDiesOn ? Effect.die(new Error("ログに書けません")) : Effect.sync(() => { count++; sequence.push("final"); finals.push({ id: `r${count}`, track: r.track, text: r.text }); words.final.push((r as { words?: unknown }).words); })),
+          segmentEnd: (segment) => Effect.sync(() => { segmentEnds.push({ track: segment.track, start: segment.start, end: segment.end }); }),
           drain: Effect.sync(() => { relayStats.drained++; }),
           clearSpeaking: Effect.sync(() => { relayStats.cleared++; }),
           stopRelays: Effect.sync(() => { relayStats.stopped++; }),
@@ -180,7 +186,7 @@ function makeFakeSessionSinks(options: { exportsFails?: boolean } = {}): Effect.
       });
     let dirCount = 0;
     const createDir = (_sessionsDir: string) => Effect.suspend(() => (control.createDirFails ? Effect.die(new Error("フォルダを作れません")) : Effect.succeed(`/tmp/live-mindmap-fake/${++dirCount}`)));
-    return { sinks: SessionSinks.of({ open, createDir, prepare: () => Effect.succeed(Layer.succeed(DiffUpdater, DiffUpdater.of({ update: () => Effect.succeed({ ops: [] }) }))) }), opened, finals, partials, words, screens, screenOffs, sequence, relayStats, appended, speakers, speakerCalls, vocabAdded, order, control };
+    return { sinks: SessionSinks.of({ open, createDir, prepare: () => Effect.succeed(Layer.succeed(DiffUpdater, DiffUpdater.of({ update: () => Effect.succeed({ ops: [] }) }))) }), opened, finals, partials, segmentEnds, words, screens, screenOffs, sequence, relayStats, appended, speakers, speakerCalls, vocabAdded, order, originWalls, control };
   });
 }
 
@@ -489,6 +495,22 @@ describe("Sessions（偽の Helpers・SessionSinks・TestClock）", () => {
         expect(fakeSinks.words.partial).toEqual([partialWords, undefined]);
         expect(fakeSinks.words.final).toEqual([finalWords, undefined]);
         expect(fakeSinks.finals.map((r) => r.text)).toEqual(["かくてい", "むき"]);
+      }));
+
+    it.effect("segment-end は、track・start・end のまま届いた順に sink.segmentEnd へ届く", () =>
+      Effect.gen(function* () {
+        const fakeHelpers = yield* makeFakeHelpers([{}]);
+        const fakeSinks = yield* makeFakeSessionSinks();
+        const { sessions } = yield* bootSessions(Layer.succeed(Helpers)(fakeHelpers.helpers), Layer.succeed(SessionSinks)(fakeSinks.sinks));
+
+        yield* sessions.start(start());
+        fakeHelpers.send(0, { type: "segment-end", track: "相手", start: 5, end: 7 });
+        fakeHelpers.send(0, { type: "segment-end", track: "自分", start: 8.5, end: 9 });
+        yield* TestClock.adjust(1);
+
+        expect(fakeSinks.segmentEnds).toEqual([{ track: "相手", start: 5, end: 7 }, { track: "自分", start: 8.5, end: 9 }]);
+        expect(fakeSinks.partials).toEqual([]);
+        expect(fakeSinks.finals).toEqual([]);
       }));
 
     it.effect("知らない type は読み飛ばされ、stderr に何も出さずセッションが続く", () =>
@@ -1732,6 +1754,32 @@ describe("Sessions（偽の Helpers・SessionSinks・TestClock）", () => {
         yield* TestClock.adjust(1_000);
 
         expect(fakeHelpers.calls).toHaveLength(1); // stop による終了を、予期せぬ終了と誤認しない
+      }));
+  });
+
+  describe("原点の壁時計（originWall）", () => {
+    it.effect("最初の origin の wallTime をセッションが持ち、sink が読める。後の origin・wallTime の無い origin は上書きしない", () =>
+      Effect.gen(function* () {
+        const fakeHelpers = yield* makeFakeHelpers([{}]);
+        const fakeSinks = yield* makeFakeSessionSinks();
+        const { sessions } = yield* bootSessions(Layer.succeed(Helpers)(fakeHelpers.helpers), Layer.succeed(SessionSinks)(fakeSinks.sinks));
+
+        yield* sessions.start(start());
+        expect(fakeSinks.originWalls).toHaveLength(1); // 開くときに渡る（origin より前に開くので、まだ値は無い）
+        const read = fakeSinks.originWalls[0]!;
+        expect(yield* read).toBeUndefined();
+
+        fakeHelpers.send(0, { type: "origin", hostTime: "1" }); // wallTime なし: 保持しない
+        yield* TestClock.adjust(1);
+        expect(yield* read).toBeUndefined();
+
+        fakeHelpers.send(0, { type: "origin", hostTime: "2", wallTime: 1_760_000_000_000 });
+        yield* TestClock.adjust(1);
+        expect(yield* read).toBe(1_760_000_000_000);
+
+        fakeHelpers.send(0, { type: "origin", hostTime: "3", wallTime: 1_770_000_000_000 }); // 2 回目以降は無視される
+        yield* TestClock.adjust(1);
+        expect(yield* read).toBe(1_760_000_000_000);
       }));
   });
 

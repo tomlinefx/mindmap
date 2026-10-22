@@ -3,7 +3,7 @@
 // 使い方は各 Command・Flag の withDescription が正本で、`live-mindmap --help` で読む（上流 ADR 0010）。
 import { basename, join, resolve } from "node:path";
 import { NodeHttpClient, NodeRuntime, NodeServices } from "@effect/platform-node";
-import { Console, Effect, FileSystem, Layer, Option, PlatformError, Predicate, Result, Schedule, Schema, type Runtime } from "effect";
+import { Console, DateTime, Effect, FileSystem, Layer, Option, PlatformError, Predicate, Result, Schedule, Schema, type Runtime } from "effect";
 import { HttpClient, HttpClientRequest, type HttpClientResponse } from "effect/http";
 import { Argument, Command, Flag } from "effect/cli";
 import { portConfig, sessionsDirConfig } from "./config.ts";
@@ -15,11 +15,13 @@ import {
   formatIntakeStatus,
   formatShareOpened,
   formatShareStatus,
+  formatLatencyTable,
   formatTable,
   DiffEvent,
   DiffUpdater,
   fromTranscript,
   JsonExport,
+  latencyReport,
   LogEvent,
   RemarkEvent,
   StartEvent,
@@ -275,7 +277,9 @@ const recordPlayback = Effect.fn("recordPlayback")(function* (
 ) {
   const sessionsDir = yield* sessionsDirConfig;
   const dir = yield* createSessionDir(sessionsDir).pipe(Effect.mapError((e) => new CommandFailed({ message: describe(e) })));
-  const { session } = yield* openLoggedSession({ dir, title: input.title, publish, model, ...(diffUpdate ? { diffUpdate } : {}) });
+  const { session, appendLog } = yield* openLoggedSession({ dir, title: input.title, publish, model, ...(diffUpdate ? { diffUpdate } : {}) });
+  // 待って流すときだけ、再生の開始（音声の時刻 0）の壁時計を残す。待たない流し直しには残さないので、遅れの集計は計測なしになる
+  if (input.realtime) yield* appendLog({ type: "origin", wallTime: DateTime.nowUnsafe().epochMilliseconds });
   yield* playback(session, input.remarks, input.realtime ? { sleep: (ms: number) => Effect.sleep(ms) } : {});
   const paths = yield* writeSessionExports(dir, yield* session.snapshot, describe, new Map()).pipe(
     Effect.mapError((e) => new CommandFailed({ message: e.message })),
@@ -494,6 +498,26 @@ const sessionLog = Effect.fnUntraced(function* (session: Option.Option<string>) 
   return { dir, logPath };
 });
 
+const latency = Command.make(
+  "latency",
+  {
+    session: Argument.String("session").pipe(
+      Argument.withDescription("遅れを集計するセッションのフォルダ（省略すると log.jsonl を持つ最新のセッション）"),
+      Argument.optional,
+    ),
+  },
+  Effect.fn("latency")(function* ({ session }) {
+    const { logPath } = yield* sessionLog(session);
+    const { lines, events } = yield* readLogLines(logPath).pipe(orFileFailed);
+    const report = yield* latencyReport(events).pipe(
+      Effect.catchTag("InvalidLogEvent", (e) => Effect.fail(new BrokenLogLine({ line: lines[e.index]?.no ?? 1, reason: e.reason }))),
+    );
+    yield* write(formatLatencyTable(report));
+  }),
+).pipe(
+  Command.withDescription("セッションの log.jsonl から、区間ごと・トラックごとの遅れ（件数・中央値・p90・最大の ms）の表を出す。本文は読まない。測れない区間は計測なし。サーバーは要らない"),
+);
+
 const review = Command.make(
   "review",
   {
@@ -657,7 +681,7 @@ const root = Command.make("live-mindmap").pipe(
     "会議の文字起こし・ライブのセッションから、議論のマインドマップを組み立てる（上流 ADR 0003）。"
       + "exit code 3 = 開始に要るもの（ヘルパー・マイクの許可・音声認識のモデル）が足りない",
   ),
-  Command.withSubcommands([play, apps, start, stop, status, resume, share, exportCommand, restore, review, evaluate, checkCommand, serverCommand]),
+  Command.withSubcommands([play, apps, start, stop, status, resume, share, exportCommand, restore, review, latency, evaluate, checkCommand, serverCommand]),
 );
 
 // argv を受けて走らせるだけ。失敗の表示はしない（入口の reportFailure が 1 か所で持つ）

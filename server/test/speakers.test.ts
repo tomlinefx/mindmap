@@ -442,6 +442,74 @@ describe("createSpeakerAttribution: 確定を待ってから出す", () => {
   });
 });
 
+describe("createSpeakerAttribution: releaseThrough（指定の発言まで保留を出す）", () => {
+  it("指定の発言と、それより前の保留を保留の順に出す。後ろの保留は残る", () => {
+    const attribution = createSpeakerAttribution();
+    const [a, b, c] = [heard("あ", 10, 11), heard("い", 11, 12), heard("う", 12, 13)] as [SettledRemark, SettledRemark, SettledRemark];
+    attribution.remarks([a, b, c], 13_000);
+
+    expect(pairs(attribution.releaseThrough(b))).toEqual([[undefined, "あ"], [undefined, "い"]]);
+    expect(attribution.heldRemarks()).toEqual([c]);
+    expect(pairs(attribution.drain())).toEqual([[undefined, "う"]]);
+  });
+
+  it("先頭の発言を指定すると、その 1 件だけ出る", () => {
+    const attribution = createSpeakerAttribution();
+    const [a, b] = [heard("あ", 10, 11), heard("い", 11, 12)] as [SettledRemark, SettledRemark];
+    attribution.remarks([a, b], 12_000);
+
+    expect(pairs(attribution.releaseThrough(a))).toEqual([[undefined, "あ"]]);
+    expect(attribution.heldRemarks()).toEqual([b]);
+  });
+
+  it("区間が揃った発言は話者付き、揃っていない発言は話者なしで出る（先頭が揃っていなくても指定した発言まで出る）", () => {
+    const attribution = createSpeakerAttribution();
+    const [a, b] = [heard("あ", 10, 14), heard("い", 11, 12)] as [SettledRemark, SettledRemark];
+    attribution.remarks([a, b], 14_000);
+    attribution.speaker(speakerEvent(2, 10, 14));
+    // い（end 12）は揃うが、先頭の あ（end 14）が揃わないので保留のまま
+    expect(attribution.speaker(settledEvent(12))).toEqual([]);
+    expect(attribution.heldRemarks()).toEqual([a, b]);
+
+    expect(pairs(attribution.releaseThrough(b))).toEqual([[undefined, "あ"], ["相手 A", "い"]]);
+    expect(attribution.heldRemarks()).toEqual([]);
+  });
+
+  it("すでに出た発言を指定しても何も出さず、保留も変えない", () => {
+    const attribution = createSpeakerAttribution();
+    const [a, b] = [heard("あ", 10, 12), heard("い", 14, 16)] as [SettledRemark, SettledRemark];
+    attribution.remarks([a], 12_000);
+    attribution.remarks([b], 12_000);
+    expect(pairs(attribution.remarks([], 12_000 + SPEAKER_WAIT_MS))).toEqual([[undefined, "あ"], [undefined, "い"]]);
+    const c = heard("う", 20, 22);
+    attribution.remarks([c], 30_000);
+
+    expect(attribution.releaseThrough(a)).toEqual([]);
+    expect(attribution.heldRemarks()).toEqual([c]);
+  });
+
+  it("同じ発言で 2 回呼んでも、2 回目は何も出さない。出した発言は、後の位置の更新や drain で出し直さない", () => {
+    const attribution = createSpeakerAttribution();
+    const [a, b] = [heard("あ", 10, 12), heard("い", 12, 14)] as [SettledRemark, SettledRemark];
+    attribution.remarks([a, b], 14_000);
+
+    expect(pairs(attribution.releaseThrough(a))).toEqual([[undefined, "あ"]]);
+    expect(attribution.releaseThrough(a)).toEqual([]);
+
+    attribution.speaker(speakerEvent(2, 10, 14));
+    expect(pairs(attribution.speaker(settledEvent(14)))).toEqual([["相手 A", "い"]]);
+    expect(attribution.drain()).toEqual([]);
+  });
+
+  it("保留に無い発言（同じ内容の別のオブジェクト）を指定しても何も出さない", () => {
+    const attribution = createSpeakerAttribution();
+    attribution.remarks([heard("あ", 10, 12)], 12_000);
+
+    expect(attribution.releaseThrough(heard("あ", 10, 12))).toEqual([]);
+    expect(attribution.heldRemarks()).toHaveLength(1);
+  });
+});
+
 describe("createSpeakerAttribution: speaker-off", () => {
   it("speaker-off の後の相手の発言は、待たずに話者なしで出る", () => {
     const attribution = createSpeakerAttribution();

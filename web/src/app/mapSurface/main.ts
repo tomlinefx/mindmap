@@ -5,7 +5,7 @@ import { HashMap, Option, Schema } from "effect";
 import { Submodel, type Update } from "foldkit";
 import type { Html, HtmlBuilder } from "foldkit/html";
 import { modifyFields } from "foldkit/struct";
-import { personLine, Snapshot, type SnapshotNode, type SpeakerNames } from "../../../../server/src/core/index.ts";
+import { PendingRemark, personLine, Snapshot, type SnapshotNode, type SpeakerNames } from "../../../../server/src/core/index.ts";
 import {
   anchoredViewport,
   cameraFocus,
@@ -46,6 +46,7 @@ import { type ArrowDir, type CameraCommand, foldToggle, humanSetsOf, INITIAL_VIE
 import { RestartBlink } from "./command.ts";
 import { Message, OutMessage } from "./message.ts";
 import { ObserveMapSurface } from "./mount.ts";
+import { pendingTray } from "./pendingTray.ts";
 
 // still は map.png の撮影用で、畳まず、大きなマップも全体を収める。live は会議中、review は見返しで、どちらも畳み、倍率を人の範囲に収める（review だけ、止めて 10 秒で自動に戻る）
 // 動きの状態（Issue #817）: motion は差分更新や高さの変化で目標の位置が変わったときの補間で、start は補間の始まりの位置（id → 位置）、elapsedMs は始めてからの経過 ms。補間していないときは None。
@@ -76,6 +77,8 @@ export const Model = Schema.Struct({
   idleStamp: Schema.Finite,
   // 話者の名前の表（ラベル → 名前。Issue #1026）。案の出した人・TODO の担当者の表示名を導く。サーバーの表を毎回写して渡す（会議中は feed から、見返しは空）
   speakerNames: Schema.Record(Schema.String, Schema.String),
+  // 取り込み待ちの一覧（map-update-latency）。speakerNames と同じく feed の値を毎回写して渡す（会議中は feed から、見返しは空）。live のときだけ出す
+  pendingRemarks: Schema.Array(PendingRemark),
 });
 export type Model = typeof Model.Type;
 
@@ -99,6 +102,7 @@ export const init = (snapshot: Snapshot, mode: Model["mode"], isMac: boolean): M
   pendingShift: false,
   idleStamp: 0,
   speakerNames: {},
+  pendingRemarks: [],
 });
 
 // 補間の長さ（ms）。React 版（useAnimatedPositions、Issue #829 で削除）から引き継いだ値
@@ -568,10 +572,15 @@ export const view = Submodel.defineView<Model, Message>((model, h): Html => {
     ]),
   );
 
+  // 取り込み待ちの一覧: live で、今の議題（畳まれていれば見えているノードに読み替える）が測れているときだけ、そのノードの位置に出す
+  const topicId = model.snapshot.currentTopic === undefined ? undefined : (view_?.shownAs[model.snapshot.currentTopic] ?? model.snapshot.currentTopic);
+  const topicAt = topicId === undefined || !HashMap.has(model.nodeHeights, topicId) ? undefined : positions[topicId];
+  const tray = model.mode !== "live" || model.pendingRemarks.length === 0 || topicAt === undefined ? [] : [pendingTray(h, model.pendingRemarks, model.speakerNames, topicAt)];
+
   return h.div(
     [h.Class("map-surface relative w-full h-full overflow-hidden z-0"), h.OnMount(ObserveMapSurface())],
     [
-      h.div([h.Class("map-viewport absolute left-0 top-0 w-full h-full origin-top-left pointer-events-none z-2"), h.Style({ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})` })], [h.svg([h.Class("map-edges absolute left-0 top-0 w-[1px] h-[1px] overflow-visible pointer-events-none")], edges), h.div([h.Class("map-nodes absolute left-0 top-0 pointer-events-none")], nodes)]),
+      h.div([h.Class("map-viewport absolute left-0 top-0 w-full h-full origin-top-left pointer-events-none z-2"), h.Style({ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})` })], [h.svg([h.Class("map-edges absolute left-0 top-0 w-[1px] h-[1px] overflow-visible pointer-events-none")], edges), h.div([h.Class("map-nodes absolute left-0 top-0 pointer-events-none")], nodes), ...tray]),
       ...(edgeDotButtons.length === 0 ? [] : [h.div([h.Class("edge-dots absolute inset-0 z-4 pointer-events-none overflow-hidden")], edgeDotButtons)]),
     ],
   );

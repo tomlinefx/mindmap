@@ -420,5 +420,13 @@ export function createSpeakerAttribution({ rules = DEFAULT_RULES, observe }: Spe
 
     // 停止時。保留を待たずにすべて出す。揃っていれば規則を当て、揃っていなければ話者なし。状態は捨てない
     drain: flush,
+
+    // 指定の発言と、それより前の保留を出す（保留の上限を超える前に出すため）。揃っていれば規則を当て、揃っていなければ話者なし。
+    // 発言には id が無いので、remarks() に渡した発言そのもの（heldRemarks() で読める）で指す。保留に無ければ（すでに出ていれば）何も出さない
+    releaseThrough(target: SettledRemark): SettledRemark[] {
+      const at = held.findIndex((h) => h.remark === target);
+      if (at < 0) return [];
+      return held.splice(0, at + 1).flatMap((h) => (isSettled(h.remark) ? attribute(h.remark) : [h.remark]));
+    },
   };
 }

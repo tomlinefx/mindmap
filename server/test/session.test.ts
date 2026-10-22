@@ -282,10 +282,13 @@ describe("ログ", () => {
       let n = 0;
       const events: LogEvent[] = [];
       const session = yield* open(() => Effect.fail(failures[n++]!), events);
-      for (const text of ["一つ目", "二つ目"]) {
-        yield* session.push(remark(text));
-        yield* session.idle;
-      }
+      yield* session.push(remark("一つ目"));
+      yield* session.idle;
+      // 失敗した回は 1 秒後に、次の発言と一緒に呼び直される
+      yield* session.push(remark("二つ目"));
+      yield* TestClock.adjust(1_000);
+      yield* settleUntil(() => n === 2);
+      yield* session.idle;
       const diffs = events.flatMap((e) => (e.type === "diff" ? [e] : []));
       expect(diffs[0]).toMatchObject({ error: "Fake: x", judge, ops: [] });
       expect(diffs[1]).toMatchObject({ error: "Fake: y" });
@@ -303,10 +306,13 @@ describe("ログ", () => {
       let n = 0;
       const events: LogEvent[] = [];
       const session = yield* open(() => Effect.succeed(results[n++]!), events);
-      for (const text of ["一つ目", "二つ目"]) {
-        yield* session.push(remark(text));
-        yield* session.idle;
-      }
+      yield* session.push(remark("一つ目"));
+      yield* session.idle;
+      // 不正な回は失敗として扱われ、1 秒後に次の発言と一緒に呼び直される
+      yield* session.push(remark("二つ目"));
+      yield* TestClock.adjust(1_000);
+      yield* settleUntil(() => n === 2);
+      yield* session.idle;
       const diffs = events.flatMap((e) => (e.type === "diff" ? [e] : []));
       expect(diffs[0]).toMatchObject({ error: "InvalidProcessedRemarks: 反映数が入力の発言数に対して不正です", judge });
       expect(diffs[1]).toMatchObject({ judge });
@@ -418,6 +424,23 @@ describe("ログ", () => {
       const roundTripped = events.map((e): unknown => JSON.parse(JSON.stringify(e)));
       const restored = yield* restoreSession(roundTripped).pipe(Effect.provide(Layer.merge(updaterLayer(() => Effect.succeed({ ops: [] })), collectLog([]))));
       expect((yield* restored.snapshot).nodes.length).toBe(1);
+    }));
+
+  // map-update-latency 6.4: 取り込み待ちに最初に出した壁時計（shownAt）を、push の 4 つ目の引数で受けて remark の行に残す
+  it.effect("push に shownAt を渡すと remark の行に残る。渡さなければ shownAt のキーごと無い", () =>
+    Effect.gen(function* () {
+      const { session, events } = yield* setup();
+      const withShown = remark("渡した発言");
+      const without = remark("渡さない発言");
+      yield* session.push(withShown, undefined, undefined, { shownAt: 1_760_000_002_000 });
+      yield* session.push(without);
+      yield* session.idle;
+
+      const rows = events.filter((e) => e.type === "remark");
+      expect(rows.map((e) => [e.remark.id, "shownAt" in e ? e.shownAt : "なし"])).toEqual([
+        [withShown.id, 1_760_000_002_000],
+        [without.id, "なし"],
+      ]);
     }));
 
   it.effect("makeSession は最初のイベントとして、タイトルを持つ開始のイベントを SessionLog に書く", () =>
@@ -538,21 +561,23 @@ describe("差分更新の呼び出し", () => {
       expect(calls.map((c2) => freshIds(c2.input))).toEqual([[a.id], [b.id], [c.id]]);
     }));
 
-  it.effect("差分更新が失敗しても、理由をログに残して次の呼び出しへ進む", () =>
+  it.effect("差分更新が失敗しても、理由をログに残し、発言を順番待ちへ戻して、待った後の次の呼び出しで新しい発言と一緒に渡す", () =>
     Effect.gen(function* () {
       let n = 0;
       const events: LogEvent[] = [];
       const update = (): Effect.Effect<DiffOutput, UpdateFailure> =>
         n++ === 0 ? Effect.fail({ _tag: "UpdateFailed", message: "timeout" }) : Effect.succeed({ ops: [{ op: "noop", reason: "雑談" }] });
       const session = yield* open(update, events);
-      for (const t of ["一", "二"]) {
-        yield* session.push(remark(t));
-        yield* session.idle;
-      }
+      yield* session.push(remark("一"));
+      yield* session.idle;
+      yield* session.push(remark("二"));
+      yield* TestClock.adjust(1_000);
+      yield* settleUntil(() => n === 2);
+      yield* session.idle;
 
       const diffs = events.filter((e) => e.type === "diff");
       expect(diffs).toHaveLength(2);
-      expect(diffs[0]).toMatchObject({ ops: [], error: expect.stringContaining("timeout") });
+      expect(diffs[0]).toMatchObject({ ops: [], error: expect.stringContaining("timeout"), requeued: true });
       expect(diffs[1]).toMatchObject({ ops: [{ op: "noop" }] });
     }));
 
@@ -566,8 +591,12 @@ describe("差分更新の呼び出し", () => {
       let n = 0;
       const events: LogEvent[] = [];
       const session = yield* open(() => steps[n++]!, events);
-      for (let i = 0; i < 3; i++) {
-        yield* session.push(remark("発言"));
+      yield* session.push(remark("発言"));
+      yield* session.idle;
+      // 失敗した回は 1 秒後、続けて失敗した回は 2 秒後に呼び直される
+      for (const wait of [1_000, 2_000]) {
+        yield* TestClock.adjust(wait);
+        yield* settle;
         yield* session.idle;
       }
 
@@ -722,7 +751,8 @@ describe("差分更新の呼び出し: 時間では呼ばない", () => {
       yield* session.push(a);
       yield* session.push(b);
       yield* session.push(c);
-      yield* TestClock.adjust("1 hour");
+      // 返らない呼び出しは 20 秒で時間切れになる。その手前までは何も起こらない
+      yield* TestClock.adjust("19 seconds");
       yield* settle;
       expect(calls).toHaveLength(1);
 

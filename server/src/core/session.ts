@@ -256,9 +256,11 @@ const freshRemarksOf = (remarks: readonly Remark[], ids: readonly string[], inva
   return Effect.succeed(fresh);
 };
 
-// diff が反映した分の発言を、復元の状態の known・processed へ足す。失敗した回は渡した発言をすべて反映済みとして扱う
+// diff が反映した分の発言を、復元の状態の known・processed へ足す。「戻した」印の回は反映した発言なし（processedRemarks があればその数）、印の無い失敗の回は渡した発言をすべて反映済みとして扱う
 const consumeFresh = (replay: Replay, fresh: readonly Remark[], e: typeof DiffEvent["Type"], invalid: (reason: string) => InvalidLogEvent): Effect.Effect<readonly Remark[], InvalidLogEvent> => {
-  const count = e.error !== undefined ? fresh.length : e.processedRemarks ?? fresh.length;
+  const count = e.requeued === true ? e.processedRemarks ?? 0
+    : e.error !== undefined ? fresh.length
+    : e.processedRemarks ?? fresh.length;
   if (count > fresh.length) return Effect.fail(invalid("diff の反映数が入力の発言数を超えています"));
   const consumed = fresh.slice(0, count);
   for (const r of consumed) {
@@ -360,7 +362,8 @@ export function snapshotOf(state: SessionState): Snapshot {
 
 export type Session = {
   // original は補正する前の本文と、その本文の位置に合わせた語。付けた発言の行に raw・words を残す
-  readonly push: (remark: Remark, original?: { readonly raw: string; readonly words: readonly Word[] }, wordTimes?: readonly WordTime[]) => Effect.Effect<void>;
+  // times は、渡すと remark の行に残す壁時計（ms）。settledAt は話者待ちから出た時刻、shownAt はその発言の項目が最初に取り込み待ちのフレームに入った時刻
+  readonly push: (remark: Remark, original?: { readonly raw: string; readonly words: readonly Word[] }, wordTimes?: readonly WordTime[], times?: { readonly settledAt?: number; readonly shownAt?: number }) => Effect.Effect<void>;
   // 呼び出し中のものと、それに続けて起きた呼び出しがすべて終わるまで待つ
   readonly idle: Effect.Effect<void>;
   // 共有画面の変化を受ける。差分更新は呼ばない。画像は writeScreen に渡し、変化ごとに screen の行を書く。
@@ -378,6 +381,10 @@ export type Session = {
   readonly nextRetryAt: Effect.Effect<number | undefined>;
   // まだマップに反映していない発言（差分更新の結果待ち + 渡していないもの）。仮のノードの文字に使う。重複の印つき・中身のない発言は含まない
   readonly unreflectedRemarks: Effect.Effect<Remark[]>;
+  // 1 つだけで試しても失敗して外した発言（取り込めなかった発言）。取り込み待ちの通知に渡す。外した順
+  readonly failedRemarks: Effect.Effect<Remark[]>;
+  // 取り込み待ちの内訳。reflecting は差分更新の結果待ち、queued は渡していないもの（unreflectedRemarks を 2 つに分けたもの。重複の印つき・中身のない発言は含まない）
+  readonly pendingBreakdown: Effect.Effect<{ readonly reflecting: Remark[]; readonly queued: Remark[] }>;
   // その時点のマップのエクスポート（JSON）
   readonly exportJson: Effect.Effect<JsonExport>;
 };
@@ -389,6 +396,10 @@ type InFlight = Reservation | { readonly kind: "running"; readonly fiber: Fiber.
 type Runtime = {
   readonly retryEnabled: boolean; // 終了のflushが始まったら、書き出し中も再試行を起動しない
   readonly nextRetryAt: number | undefined; // 一時停止から次に再試行する時刻（エポックからのミリ秒）。一時停止の間だけ持つ
+  readonly backoffMs: number; // 次に失敗したときに待つ間隔。成功で DIFF_RETRY_INITIAL_MS に戻す
+  readonly backingOff: boolean; // 失敗した回の再試行を待っている間。この間は新しい発言が来ても呼び出さない
+  readonly failures: ReadonlyMap<string, number>; // 発言の ID ごとの、応答が返ってきたうえでの失敗の回数。成功した回に入っていた発言は、一部しか反映されず pending に戻るものも含めて外す（数え直す）。restore では 0 から数え直す
+  readonly failed: readonly Remark[]; // 1 つだけで試しても失敗して外した発言
   readonly inFlight: InFlight | undefined;
   readonly reflecting: readonly Remark[]; // 差分更新の結果待ちの発言。結果を log する直前に外す
   readonly catchUpUntil: string | undefined; // 一時停止の間にたまった発言の最後の ID。これが pending に残っている間は CATCH_UP_REMARKS 件ずつ渡す
@@ -412,6 +423,29 @@ export const CATCH_UP_REMARKS = 2;
 // 1 回の呼び出しに添える共有画面の上限（新しいものから）。通常時の費用を抑えるための上限。
 // Why: 一時停止の間にたまった画面（catchUpScreen まで）には適用しない。受け取った順と start の順は食い違うことがあり、境目（start <= cutoff）で未送信一覧から外れる順は start の順なので、start が最も遅いものを印にする。切り捨てた画面は未送信一覧からも外れるので、後の回で回復できず、映った時刻の発言に添えられなくなる
 const SCREENS_MAX = 3;
+// 差分更新 1 回の呼び出しの時間切れ。超えたら中断して失敗として扱い、発言を順番待ちの先頭へ戻す。
+// Why: 応答が返らない呼び出しが居座ると、その間の発言がすべてマップに載らない
+const DIFF_CALL_TIMEOUT_MS = 20_000;
+// 失敗した回の再試行の間隔。最初は 1 秒、失敗のたびに倍にして 10 秒まで。成功で 1 秒に戻す
+// （一時停止の再試行 DIFF_UPDATE_RETRY_MS とは別。一時停止は失敗として数えない）
+const DIFF_RETRY_INITIAL_MS = 1_000;
+const DIFF_RETRY_MAX_MS = 10_000;
+// 同じ発言の失敗がこの回数に達したら、次の呼び出しをその発言 1 つだけにし、それも失敗したら外す
+const ISOLATE_AFTER_FAILURES = 3;
+// 数える失敗は、応答が返ってきたうえでのものだけ。
+// Why: 時間切れ・つながらない失敗（DiffCallTimeout・ClaudeQueryFailed）は回線の都合で、発言のせいではない。数えると、回線が落ちている間に発言を外してしまう
+const RESPONDED_FAILURE_TAGS: ReadonlySet<string> = new Set(["DiffOutputInvalid", "ClaudeResultFailed", "InvalidProcessedRemarks"]);
+
+// 数える失敗（counted）のときだけ、渡した発言それぞれの回数を 1 増やす
+const bumped = (counts: ReadonlyMap<string, number>, remarks: readonly Remark[], counted: boolean): ReadonlyMap<string, number> =>
+  counted ? new Map([...counts, ...remarks.map((r): [string, number] => [r.id, (counts.get(r.id) ?? 0) + 1])]) : counts;
+// 1 つだけの呼び出し（頭の発言だけを渡した回）か。takeStep が渡す発言は、必ずこの条件を満たす
+const isIsolated = (counts: ReadonlyMap<string, number>, fresh: readonly Remark[]): boolean =>
+  fresh.length === 1 && (counts.get(fresh[0]!.id) ?? 0) >= ISOLATE_AFTER_FAILURES;
+const without = (counts: ReadonlyMap<string, number>, remarks: readonly Remark[]): ReadonlyMap<string, number> => {
+  const ids = new Set(remarks.map((r) => r.id));
+  return new Map([...counts].filter(([id]) => !ids.has(id)));
+};
 
 // 映り始めた時刻から付ける画像のファイル名（整数部 4 桁・小数 1 桁。例 0754.2.jpg）。重なったら 2 件目から -n を足す
 function screenFileName(start: number, used: ReadonlySet<string>): string {
@@ -436,6 +470,7 @@ const classifyFailure = (cause: Cause.Cause<DiffUpdateFailure>) => {
     error: Result.isSuccess(failure) ? `${failure.success._tag}: ${failure.success.message}` : `defect: ${String(Cause.squash(cause))}`,
     pause: Result.isSuccess(failure) && failure.success instanceof DiffUpdatePaused ? failure.success : undefined,
     stopped: Result.isSuccess(failure) && failure.success._tag === "DiffUpdateStopped",
+    counted: Result.isSuccess(failure) && RESPONDED_FAILURE_TAGS.has(failure.success._tag),
   };
 };
 
@@ -453,14 +488,16 @@ const noScreens: InitialScreens = { unsent: [], last: [], files: new Set(), rece
 // 確かめを通った AI の名前を受け取る（diff の行を書いた後に呼ぶ）。cli play・復元は渡さない
 export type OnSpeakerNames = (names: readonly InferredSpeakerName[]) => Effect.Effect<void>;
 
-function openSession(initial: SessionState, screens: InitialScreens, images: boolean, logShiftMs = 0, onSpeakerNames?: OnSpeakerNames): Effect.Effect<Session, never, Scope.Scope | DiffUpdater | SessionLog> {
+function openSession(initial: SessionState, screens: InitialScreens, images: boolean, logShiftMs = 0, onSpeakerNames?: OnSpeakerNames, onPendingChange?: Effect.Effect<void>): Effect.Effect<Session, never, Scope.Scope | DiffUpdater | SessionLog> {
   return Effect.gen(function* () {
     const scope = yield* Effect.scope;
     const updater = yield* DiffUpdater;
     const log = yield* SessionLog;
     // 通った名前が 1 件以上あるときだけ、受け取る側（あれば）へ渡す
+    // 取り込み待ち（pending・reflecting・failed）が変わったことだけを知らせる。状態は読むだけで変えない
+    const notifyPendingChange: Effect.Effect<void> = onPendingChange ?? Effect.void;
     const notifySpeakerNames = (accepted: readonly InferredSpeakerName[]): Effect.Effect<void> => (onSpeakerNames && accepted.length > 0 ? onSpeakerNames(accepted) : Effect.void);
-    const ref = yield* Ref.make<SessionState & Runtime>({ ...initial, retryEnabled: true, nextRetryAt: undefined, inFlight: undefined, reflecting: [], catchUpUntil: undefined, catchUpScreen: undefined, unsentScreens: screens.unsent, screenFiles: screens.files, lastScreens: screens.last, receivedScreens: screens.received, carriedScreen: screens.carried, lastImageStart: screens.anchor });
+    const ref = yield* Ref.make<SessionState & Runtime>({ ...initial, retryEnabled: true, nextRetryAt: undefined, backoffMs: DIFF_RETRY_INITIAL_MS, backingOff: false, failures: new Map(), failed: [], inFlight: undefined, reflecting: [], catchUpUntil: undefined, catchUpScreen: undefined, unsentScreens: screens.unsent, screenFiles: screens.files, lastScreens: screens.last, receivedScreens: screens.received, carriedScreen: screens.carried, lastImageStart: screens.anchor });
 
     const setLifecycleState = Effect.fnUntraced(function* (state: DiffUpdateState) {
       const changed = yield* Ref.modify(ref, (s): [boolean, SessionState & Runtime] =>
@@ -475,6 +512,9 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
     // 呼び出し中でなく、発言が 1 つ以上たまっていれば、たまった分をまとめて差分更新に渡す。
     // 取り出しから fork までの間に中断されて発言を取りこぼさないよう、中断させない
     function takeStep(s: SessionState & Runtime, reservation: Reservation): [readonly Remark[], SessionState & Runtime] {
+      const head = s.pending[0];
+      // 頭の発言の失敗が ISOLATE_AFTER_FAILURES に達していたら、その発言だけを渡す。後ろの発言は次の呼び出しへ回す
+      if (head && (s.failures.get(head.id) ?? 0) >= ISOLATE_AFTER_FAILURES) return [[head], { ...s, pending: s.pending.slice(1), inFlight: reservation }];
       const taken = takeFresh(s.pending, s.catchUpUntil);
       return [taken.fresh, { ...s, pending: taken.rest, catchUpUntil: taken.catchUpUntil, inFlight: reservation }];
     }
@@ -484,7 +524,7 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
         Effect.gen(function* () {
           const reservation: Reservation = { kind: "reserved" };
           const fresh = yield* Ref.modify(ref, (s): [readonly Remark[] | undefined, SessionState & Runtime] =>
-            s.inFlight || s.pending.length === 0 || (retry ? !s.retryEnabled || s.diffUpdate.status !== "paused" : s.diffUpdate.status === "paused" || s.diffUpdate.status === "stopped") ? [undefined, s] : takeStep(s, reservation),
+            s.inFlight || s.backingOff || s.pending.length === 0 || (retry ? !s.retryEnabled || s.diffUpdate.status !== "paused" : s.diffUpdate.status === "paused" || s.diffUpdate.status === "stopped") ? [undefined, s] : takeStep(s, reservation),
           );
           if (!fresh) return;
           const fiber = yield* Effect.forkIn(Effect.interruptible(runCall(fresh)), scope, { startImmediately: true });
@@ -514,6 +554,8 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
           Effect.gen(function* () {
             yield* Ref.update(ref, (s) => ({ ...s, inFlight: undefined }));
             if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) return;
+            // 成功・失敗・一時停止・停止のどの終わりでも、reflecting・pending・failed が替わっているので知らせる
+            yield* notifyPendingChange;
             const state = yield* Ref.get(ref);
             if (state.diffUpdate.status === "paused") {
               yield* scheduleRetry;
@@ -526,11 +568,36 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
       );
     }
 
+    // 一時停止・停止ではない失敗の後始末。1 つだけで試した回が応答の失敗で終わったら、その発言を外して「取り込めなかった」として持つ（戻さず、間隔も置かず、後ろの発言をすぐ呼ぶ）。
+    // それ以外は、失敗した回の発言を処理済みにせず順番待ちの先頭へ戻し、間隔（1 秒から倍、10 秒まで）を置いて次の発言と一緒に呼び直す。応答の失敗は発言ごとに数える。
+    // Why: 時間切れ・つながらない失敗は数えないので、1 つだけの回でも戻す（回線のせいで発言を外さない）
+    const settleFailure = Effect.fnUntraced(function* ({ fresh, input, outcome, isolated }: { readonly fresh: readonly Remark[]; readonly input: typeof DiffEvent["Type"]["input"]; readonly outcome: ReturnType<typeof classifyFailure> & { readonly call: { readonly startedAt: string; readonly endedAt: string } | undefined }; readonly isolated: boolean }) {
+      const isolatedMark = isolated ? { isolated: true as const } : {};
+      if (isolated && outcome.counted) {
+        yield* Ref.update(ref, (s) => ({ ...s, diffUpdate: s.diffUpdate.status === "paused" ? { status: "running" as const } : s.diffUpdate, nextRetryAt: undefined, reflecting: [], previousResponse: undefined, failures: without(s.failures, fresh), failed: [...s.failed, ...fresh] }));
+        yield* log.write({ type: "diff", input, ops: [], dropped: [], error: outcome.error, ...isolatedMark, ...presentFields(outcome, ["judge", "call"]) });
+        return;
+      }
+      const wait = yield* Ref.modify(ref, (s): [number, SessionState & Runtime] => [s.backoffMs, { ...s, diffUpdate: s.diffUpdate.status === "paused" ? { status: "running" as const } : s.diffUpdate, nextRetryAt: undefined, reflecting: [], pending: [...fresh, ...s.pending], previousResponse: undefined, backingOff: true, backoffMs: Math.min(s.backoffMs * 2, DIFF_RETRY_MAX_MS), failures: bumped(s.failures, fresh, outcome.counted) }]);
+      yield* log.write({ type: "diff", input, ops: [], dropped: [], error: outcome.error, requeued: true, ...isolatedMark, ...presentFields(outcome, ["judge", "call"]) });
+      // flush が始まった後（retryEnabled が false）は、印を外すだけで呼び出さない
+      yield* Effect.forkIn(
+        Effect.sleep(wait).pipe(
+          Effect.andThen(Ref.modify(ref, (s): [boolean, SessionState & Runtime] => [s.retryEnabled, { ...s, backingOff: false }])),
+          Effect.flatMap((enabled) => (enabled ? startDiffIfReady() : Effect.void)),
+        ),
+        scope,
+      );
+    });
+
     // update だけを中断可能にする。状態の反映から SessionLog.write までは中断させない
     function callUpdater(fresh: readonly Remark[]): Effect.Effect<void> {
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
-          const state = (yield* Ref.get(ref)).diffUpdate;
+          const { diffUpdate: state, failures } = yield* Ref.get(ref);
+          // 1 つだけの呼び出し（takeStep が頭の発言だけを渡した回）。diff の行に印を付ける
+          const isolated = isIsolated(failures, fresh);
+          const isolatedMark = isolated ? { isolated: true as const } : {};
           if (state.status === "paused") yield* log.write({ type: "diff-update-retry", reason: state.reason });
           const { map, recent, input, attached, previous, previousResponse, before, keptUnsent } = yield* Ref.modify(ref, (s) => {
             const recent = s.processed.slice(-RECENT);
@@ -568,6 +635,7 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
               },
             ];
           });
+          yield* notifyPendingChange; // reflecting に入った
           // 添える画像と送り直す画像だけを、ここで読み戻す（画像のバイト列はメモリに持たない）
           const readBack = (h: HeldScreen): Effect.Effect<ScreenChange> => {
             const held = h.image;
@@ -588,7 +656,10 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
             Effect.flatMap(([screens, previousScreens]) =>
               Effect.suspend(() => {
                 const startedAt = logTimestamp(logShiftMs);
-                return Effect.exit(restore(updater.update({ map, recent: [...recent], fresh: [...fresh], ...(screens.length ? { screens } : {}), ...(previousScreens.length ? { previousScreens } : {}), ...(previousResponse ? { previousResponse } : {}) }))).pipe(
+                const timeout = Effect.fail({ _tag: "DiffCallTimeout", message: `差分更新が ${DIFF_CALL_TIMEOUT_MS / 1000} 秒を超えたため中断した` } as DiffUpdateFailure);
+                return Effect.exit(restore(updater.update({ map, recent: [...recent], fresh: [...fresh], ...(screens.length ? { screens } : {}), ...(previousScreens.length ? { previousScreens } : {}), ...(previousResponse ? { previousResponse } : {}) }).pipe(
+                  Effect.timeoutOrElse({ duration: DIFF_CALL_TIMEOUT_MS, orElse: () => timeout }),
+                ))).pipe(
                   Effect.map((exit) => ({ exit, call: { startedAt, endedAt: logTimestamp(logShiftMs) } as CallTimes })),
                 );
               }),
@@ -626,9 +697,8 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
               yield* log.write({ type: "diff-update-paused", reason });
               return;
             }
-            // 失敗した回の発言は処理済みとして扱い、マップは変えずに次へ進む
-            yield* Ref.update(ref, (s) => ({ ...s, diffUpdate: s.diffUpdate.status === "paused" ? { status: "running" as const } : s.diffUpdate, nextRetryAt: undefined, reflecting: [], known: new Set([...s.known, ...fresh.map((r) => r.id)]), processed: [...s.processed, ...fresh], previousResponse: undefined }));
-            yield* log.write({ type: "diff", input, ops: [], dropped: [], error: outcome.error, ...presentFields(outcome, ["judge", "call"]) });
+            // 1 つだけで試した回は外し、それ以外は戻す
+            yield* settleFailure({ fresh, input, outcome, isolated });
             return;
           }
           // ログへ書く（SessionLog.write）より先に状態へ反映する。write の中で読むスナップショットに今回分が載る
@@ -643,11 +713,11 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
             // 名前の根拠は、ノードの根拠と同じ known と byId で確かめる
             const accepted = acceptInferredNames(outcome.names, known, byId);
             return [{ dropped: applied.dropped, ops, accepted }, {
-              ...s, ...recordRound(s, s.map, applied, stamp), diffUpdate: s.diffUpdate.status === "paused" ? { status: "running" as const } : s.diffUpdate, nextRetryAt: undefined, map: applied.map, reflecting: [], previousResponse: previousResponseOf(applied),
+              ...s, ...recordRound(s, s.map, applied, stamp), diffUpdate: s.diffUpdate.status === "paused" ? { status: "running" as const } : s.diffUpdate, nextRetryAt: undefined, backoffMs: DIFF_RETRY_INITIAL_MS, failures: without(s.failures, fresh), map: applied.map, reflecting: [], previousResponse: previousResponseOf(applied),
               known, processed: [...s.processed, ...consumed], pending: [...fresh.slice(outcome.count), ...s.pending],
             }];
           });
-          yield* log.write({ type: "diff", input, ops, dropped, ...presentFields(outcome, ["processedRemarks", "usage", "judge", "call"]) });
+          yield* log.write({ type: "diff", input, ops, dropped, ...isolatedMark, ...presentFields(outcome, ["processedRemarks", "usage", "judge", "call"]) });
           if (state.status === "paused") yield* log.write({ type: "diff-update-resumed" });
           yield* notifySpeakerNames(accepted);
         }),
@@ -665,10 +735,10 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
     });
 
     return {
-      push: (r, original, wordTimes) =>
+      push: (r, original, wordTimes, times) =>
         Effect.gen(function* () {
           yield* Ref.update(ref, (s) => ({ ...s, remarks: [...s.remarks, r] }));
-          const extra = { ...(original === undefined ? {} : { raw: original.raw, words: original.words }), ...(wordTimes === undefined ? {} : { wordTimes }) };
+          const extra = { ...(original === undefined ? {} : { raw: original.raw, words: original.words }), ...(wordTimes === undefined ? {} : { wordTimes }), ...(times?.settledAt === undefined ? {} : { settledAt: times.settledAt }), ...(times?.shownAt === undefined ? {} : { shownAt: times.shownAt }) };
           if (!r.duplicate && !hasContent(r.text)) {
             // 中身のない発言: ログには残すが、差分更新・未反映の発言には関わらせない
             yield* log.write({ type: "remark", remark: r, noContent: true, ...extra });
@@ -677,6 +747,7 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
           yield* log.write({ type: "remark", remark: r, ...extra });
           if (r.duplicate) return;
           yield* Ref.update(ref, (s) => ({ ...s, pending: [...s.pending, r], catchUpUntil: s.diffUpdate.status === "paused" ? r.id : s.catchUpUntil }));
+          yield* notifyPendingChange;
           yield* startDiffIfReady();
         }),
       idle,
@@ -700,7 +771,8 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
         for (;;) {
           yield* idle;
           const state = yield* Ref.get(ref);
-          if (state.pending.length === 0 || state.diffUpdate.status === "paused" || state.diffUpdate.status === "stopped") return;
+          // 失敗した回の待ち中は、待たずに戻す（失敗が続くと終わらない）。残った発言はログの requeued で復元側が拾う
+          if (state.pending.length === 0 || state.backingOff || state.diffUpdate.status === "paused" || state.diffUpdate.status === "stopped") return;
           yield* startDiffIfReady();
         }
       }),
@@ -708,13 +780,15 @@ function openSession(initial: SessionState, screens: InitialScreens, images: boo
       diffUpdate: Effect.map(Ref.get(ref), (s) => s.diffUpdate),
       nextRetryAt: Effect.map(Ref.get(ref), (s) => s.nextRetryAt),
       unreflectedRemarks: Effect.map(Ref.get(ref), (s) => [...s.reflecting, ...s.pending].map((r) => ({ ...r }))),
+      failedRemarks: Effect.map(Ref.get(ref), (s) => s.failed.map((r) => ({ ...r }))),
+      pendingBreakdown: Effect.map(Ref.get(ref), (s) => ({ reflecting: s.reflecting.map((r) => ({ ...r })), queued: s.pending.map((r) => ({ ...r })) })),
       exportJson: Effect.map(Ref.get(ref), (s) => toJsonExport(snapshotOf(s), [...s.remarks])),
     } satisfies Session;
   });
 }
 
 // 新しいセッションを開く。最初に start をログへ書く。差分更新の呼び出しはこの Scope の Fiber で、Scope を閉じると中断される
-export const makeSession = Effect.fnUntraced(function* ({ title, images = true, logShiftMs = 0, onSpeakerNames }: { readonly title: string; readonly images?: boolean; readonly logShiftMs?: number; readonly onSpeakerNames?: OnSpeakerNames }): Effect.fn.Return<Session, never, Scope.Scope | DiffUpdater | SessionLog> {
+export const makeSession = Effect.fnUntraced(function* ({ title, images = true, logShiftMs = 0, onSpeakerNames, onPendingChange }: { readonly title: string; readonly images?: boolean; readonly logShiftMs?: number; readonly onSpeakerNames?: OnSpeakerNames; readonly onPendingChange?: Effect.Effect<void> }): Effect.fn.Return<Session, never, Scope.Scope | DiffUpdater | SessionLog> {
   const log = yield* SessionLog;
   yield* log.write({ type: "start", title });
   if (!images) yield* log.write({
@@ -733,7 +807,7 @@ export const makeSession = Effect.fnUntraced(function* ({ title, images = true, 
     lastChanged: undefined,
     previousResponse: undefined,
     diffUpdate: { status: "running" },
-  }, noScreens, images, logShiftMs, onSpeakerNames);
+  }, noScreens, images, logShiftMs, onSpeakerNames, onPendingChange);
 });
 
 // ログのイベントから、セッションを元の状態に戻す。差分更新は呼ばず、イベントも log し直さない。

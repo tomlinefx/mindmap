@@ -76,6 +76,7 @@ type Live = {
   chain: Ref.Ref<Fiber.Fiber<ChainEnd> | undefined>; // いまの起動し直しの連鎖
   intake: Ref.Ref<IntakeKind>;
   origin: Ref.Ref<string | undefined>; // 最初のヘルパーから受け取った原点。一度決まったら上書きしない
+  originWall: Ref.Ref<number | undefined>; // 同じ origin の壁時計（ms）。最初に wallTime を持って届いた値だけ採用する。sink が保留の期限の起点に読む
   attemptStartedAt: Ref.Ref<number>; // 直近の起動を始めた時刻（Clock）。60 秒の判断の基準
   failures: Ref.Ref<number>; // 続けて失敗した回数（decideIntakeRestart が進める。構成の変化による終了は数えない）
   configurationChanges: Ref.Ref<ReadonlyArray<number>>; // 構成の変化（終了コード 75）で終わった時刻（Clock）。窓の外は decideIntakeRestart が除く
@@ -166,13 +167,24 @@ export class Sessions extends Context.Service<Sessions, {
       // 知らない type は何も出さずに読み飛ばし、壊れたイベントと処理の失敗は文面を分けて 1 行出して読み続ける（セッションは止めない）
       const applyEvent = (live: Live, event: HelperEvent): Effect.Effect<void> => {
         switch (event.type) {
-          case "origin":
+          case "origin": {
             // 原点は最初のヘルパーからの値だけ採用する
             // 新しい origin は起動し直したヘルパーのもので、前の回の「届いていません」は消す（保持が無ければ何も変わらない）
+            // 採用した最初の壁時計だけ、origin の行としてログに残す（起動し直しの 2 つ目以降・wallTime の無い origin は残さない）
+            const { wallTime } = event;
             return Effect.andThen(
-              Ref.update(live.origin, (origin) => origin ?? event.hostTime),
+              Effect.andThen(
+                Ref.update(live.origin, (origin) => origin ?? event.hostTime),
+                wallTime === undefined
+                  ? Effect.void
+                  : Effect.flatMap(
+                    Ref.modify(live.originWall, (wall): [boolean, number | undefined] => (wall === undefined ? [true, wallTime] : [false, wall])),
+                    (adopted) => (adopted ? live.sink.appendLog({ type: "origin", wallTime }) : Effect.void),
+                  ),
+              ),
               viewers.tapNotice({ type: "tap-notice", text: null }),
             );
+          }
           case "remark": {
             const { type: _type, ...settled } = event;
             return live.sink.final(settled);
@@ -218,8 +230,8 @@ export class Sessions extends Context.Service<Sessions, {
             // 共有画面と録画の文字起こしは初版では無い。イベントの形は上流のまま保ち、届いても何もしない
             return Effect.void;
           case "segment-end":
-            // 取り込み待ちの仮の表示に使うまでは、届いても何もしない
-            return Effect.void;
+            // 取り込み待ちの仮の項目（closing）を入れる。本文と期限は sink が持つ
+            return live.sink.segmentEnd({ track: event.track, start: event.start, end: event.end });
           case "speaker":
           case "speaker-off":
           case "speaker-settled":
@@ -365,7 +377,8 @@ export class Sessions extends Context.Service<Sessions, {
             );
           // 初期ルートの公開は、ヘルパーへの接続が成功した後にする。公開したフレームは取り消せないので、
           // 開始に失敗するときに、接続中のクライアントへ空のマップを送らない
-          const sink = yield* sinks.open({ dir, title: input.title, model: input.model, updaterLayer, publish: viewers.publish, speak: viewers.speak, speakerNames: viewers.speakerNames, diffUpdate: viewers.diffUpdate }).pipe(Scope.provide(scope));
+          const originWall = yield* Ref.make<number | undefined>(undefined);
+          const sink = yield* sinks.open({ originWall: Ref.get(originWall), dir, title: input.title, model: input.model, updaterLayer, publish: viewers.publish, speak: viewers.speak, speakerNames: viewers.speakerNames, pendingRemarks: viewers.pendingRemarks, diffUpdate: viewers.diffUpdate }).pipe(Scope.provide(scope));
           const live: Live = {
             model: input.model,
             app: input.app,
@@ -376,6 +389,7 @@ export class Sessions extends Context.Service<Sessions, {
             chain: yield* Ref.make<Fiber.Fiber<ChainEnd> | undefined>(undefined),
             intake: yield* Ref.make<IntakeKind>("running"),
             origin: yield* Ref.make<string | undefined>(undefined),
+            originWall,
             attemptStartedAt: yield* Ref.make(startedAt),
             failures: yield* Ref.make(0),
             configurationChanges: yield* Ref.make<ReadonlyArray<number>>([]),

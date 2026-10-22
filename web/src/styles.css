@@ -48,6 +48,15 @@ body { font-family: system-ui, "Hiragino Sans", sans-serif; background: var(--co
   box-shadow: none;
   position: relative;
 }
+/* 取り込み待ちの一覧: ノードと見分けられるよう、点線の枠と白地にし、種類色の塗りは使わない。今の議題のノードの上端から上へ伸ばす。
+   仮（聞き取り中）の本文は薄く、取り込めなかった項目は警告の色（orange-700）。影・バッジは付けない */
+.pending-tray { display: flex; flex-direction: column; gap: 2px; padding-bottom: 6px; font-size: 12px; line-height: 1.4; }
+.pending-tray__item { display: flex; gap: 6px; align-items: baseline; box-sizing: border-box; padding: 3px 8px; color: var(--color-gray-700); background: var(--color-white); border: 1px dashed var(--color-gray-400); border-radius: 8px; }
+.pending-tray__speaker { flex: none; font-weight: 600; }
+.pending-tray__text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.pending-tray__text--tentative { color: var(--color-gray-400); }
+.pending-tray__state { flex: none; font-size: 11px; color: var(--color-gray-500); }
+.pending-tray__item--failed, .pending-tray__item--failed .pending-tray__state { color: var(--color-orange-700); border-color: var(--color-orange-700); }
 /* 余白・並びは内側のボタンが持つ（外側は枠と塗りだけ。実寸は変えない） */
 .map-node__button { display: flex; gap: 6px; align-items: baseline; width: 100%; padding: 8px 12px; border: 0; background: none; font: inherit; color: inherit; text-align: left; cursor: pointer; pointer-events: all; position: relative; }
 .map-node__mark { flex: none; font-weight: 600; color: var(--kind-color); }

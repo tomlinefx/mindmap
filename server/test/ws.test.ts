@@ -2,7 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Queue } from "effect";
 import { Socket } from "effect/socket";
 import { TestClock } from "effect/testing";
-import type { CaptionsFrame, IntakeFrame, Snapshot } from "../src/core/index.ts";
+import type { CaptionsFrame, IntakeFrame, PendingRemarksFrame, Snapshot } from "../src/core/index.ts";
 import { Viewers } from "../src/viewers.ts";
 
 const snap = (...texts: string[]): Snapshot => ({
@@ -214,6 +214,49 @@ describe("Viewers の配信と保持（要件14〜18・25）", () => {
       expect(yield* Queue.take(second.frames)).toEqual(intake("none"));
       yield* TestClock.adjust(1);
       expect(yield* Queue.size(second.frames)).toBe(0);
+    }).pipe(Effect.provide(Viewers.layer)));
+
+  // map-update-latency 6.4: 取り込み待ちのフレームは最後の 1 つを保持する。項目が 1 つでもあれば後からつないだクライアントに送り、空のフレームで保持も消す
+  it.effect("取り込み待ちのフレームは、接続中へ届き、後からつないだクライアントにも最後の 1 つが届く。空のフレームを送ると、その後の接続には届かない", () =>
+    Effect.gen(function* () {
+      const viewers = yield* Viewers;
+      const item = { key: "相手:5", track: "相手", text: "来週の会議", start: 5, end: 7, since: 100 } as const;
+      const queued: PendingRemarksFrame = { type: "pending-remarks", remarks: [{ ...item, state: "queued" }] };
+      const reflecting: PendingRemarksFrame = { type: "pending-remarks", remarks: [{ ...item, state: "reflecting", id: "r1" }] };
+      const first = yield* client(Effect.void);
+      yield* Effect.forkChild(viewers.connect(first.socket));
+      yield* viewers.pendingRemarks(queued);
+      expect(yield* Queue.take(first.frames)).toEqual(queued);
+
+      yield* viewers.pendingRemarks(reflecting);
+      expect(yield* Queue.take(first.frames)).toEqual(reflecting);
+      const late = yield* client(Effect.void);
+      yield* Effect.forkChild(viewers.connect(late.socket));
+      expect(yield* Queue.take(late.frames)).toEqual(reflecting); // 最後の 1 つだけ
+      yield* Effect.yieldNow;
+      expect(yield* Queue.size(late.frames)).toBe(0);
+
+      const empty: PendingRemarksFrame = { type: "pending-remarks", remarks: [] };
+      yield* viewers.pendingRemarks(empty);
+      expect(yield* Queue.take(first.frames)).toEqual(empty); // 接続中には空も届く
+      expect(yield* Queue.take(late.frames)).toEqual(empty);
+      const after = yield* client(Effect.void);
+      yield* Effect.forkChild(viewers.connect(after.socket));
+      yield* Effect.yieldNow;
+      expect(yield* Queue.size(after.frames)).toBe(0); // 空になった後につないだクライアントには何も送らない
+    }).pipe(Effect.provide(Viewers.layer)));
+
+  it.effect("取り込み待ちのフレームの保持は他の保持と独立している（空にしても、取り込みの状態の保持は残る）", () =>
+    Effect.gen(function* () {
+      const viewers = yield* Viewers;
+      yield* viewers.intake(intake("running"));
+      yield* viewers.pendingRemarks({ type: "pending-remarks", remarks: [{ key: "相手:5", track: "相手", text: "", start: 5, end: 7, since: 0, state: "closing" }] });
+      yield* viewers.pendingRemarks({ type: "pending-remarks", remarks: [] });
+      const late = yield* client(Effect.void);
+      yield* Effect.forkChild(viewers.connect(late.socket));
+      expect(yield* Queue.take(late.frames)).toEqual(intake("running"));
+      yield* Effect.yieldNow;
+      expect(yield* Queue.size(late.frames)).toBe(0);
     }).pipe(Effect.provide(Viewers.layer)));
 
   it.effect("初回送信中の更新を、保持値送信後に取りこぼさず届ける（要件16）", () =>

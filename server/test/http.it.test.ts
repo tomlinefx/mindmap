@@ -130,6 +130,122 @@ describe("HTTP の失敗応答（要件8〜11）", () => {
     yield* wait(after.frames, null);
     expect(frames(after.frames)).toEqual([{ type: "diff-update", state: null }]);
   }));
+  // map-update-latency 6.4: 取り込み待ちのフレームは最後の 1 つを保持し、後からつないだ画面にも送る。項目が無くなった後・セッションが終わった後につないだ画面には送らない
+  describe("取り込み待ちのフレームの保持（map-update-latency 6.4）", () => {
+    const pendingFrames = (all: unknown[]) => all.filter((f): f is { type: "pending-remarks"; remarks: Array<{ state: string; text: string; key: string }> } => typeof f === "object" && f !== null && "type" in f && f.type === "pending-remarks");
+    const SPEAKER_OFF_EVENT = { type: "speaker-off", start: 0, reason: "モデルなし" };
+
+    it.live("反映中の発言があるとき、後からつないだ画面にも取り込み待ちのフレームが届く。反映が済んで空のフレームが出た後につないだ画面には届かない", () => Effect.gen(function* () {
+      const gate = yield* Deferred.make<void>();
+      const r = yield* resourceWithFakeHelpers([{ events: [SPEAKER_OFF_EVENT, { type: "remark", track: "相手", start: 0, end: 1, text: "反映待ちの発言" }] }], {
+        updaterLayer: () => updaterLayer(() => Effect.as(Deferred.await(gate), { ops: [] })),
+      });
+      const early = yield* connect(r.server.port, "/ws", undefined);
+      expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"us.zoom.xos"}', undefined))).status).toBe(200);
+      yield* Effect.tryPromise(() => vi.waitFor(() => expect(pendingFrames(early.frames).at(-1)?.remarks.map((x) => [x.state, x.text])).toEqual([["reflecting", "反映待ちの発言"]]), { timeout: 10_000 }));
+
+      const late = yield* connect(r.server.port, "/ws", undefined);
+      yield* Effect.tryPromise(() => vi.waitFor(() => expect(pendingFrames(late.frames).map((f) => f.remarks.map((x) => [x.state, x.text]))).toEqual([[["reflecting", "反映待ちの発言"]]])));
+
+      yield* Deferred.succeed(gate, undefined);
+      yield* Effect.tryPromise(() => vi.waitFor(() => expect(pendingFrames(early.frames).at(-1)?.remarks).toEqual([]), { timeout: 10_000 }));
+      yield* Effect.tryPromise(() => vi.waitFor(() => expect(pendingFrames(late.frames).at(-1)?.remarks).toEqual([])));
+      const after = yield* connect(r.server.port, "/ws", undefined);
+      yield* Effect.tryPromise(() => vi.waitFor(() => expect(after.frames.length).toBeGreaterThan(0))); // 保持している他のフレームは届く
+      yield* Effect.tryPromise(() => new Promise<void>((resolve) => setTimeout(resolve, 100)));
+      expect(pendingFrames(after.frames)).toEqual([]);
+    }));
+
+    it.live("セッションを終えた後につないだ画面には、終える前に項目が残っていた取り込み待ちのフレームが届かない", () => Effect.gen(function* () {
+      let calls = 0;
+      const r = yield* resourceWithFakeHelpers([{ events: [SPEAKER_OFF_EVENT, { type: "remark", track: "相手", start: 0, end: 1, text: "取り込めない発言" }] }], {
+        updaterLayer: () => updaterLayer(() => Effect.suspend(() => {
+          calls++;
+          return Effect.fail(new DiffUpdatePaused({ reason: "ChatGPT の利用上限", message: "合成の利用上限" }));
+        })),
+      });
+      const viewer = yield* connect(r.server.port, "/ws", undefined);
+      expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"us.zoom.xos"}', undefined))).status).toBe(200);
+      yield* Effect.tryPromise(() => vi.waitFor(() => {
+        expect(calls).toBe(1);
+        expect(pendingFrames(viewer.frames).at(-1)?.remarks.map((x) => x.text)).toEqual(["取り込めない発言"]); // 終える前は項目が残っている
+      }, { timeout: 10_000 }));
+
+      expect((yield* Effect.tryPromise(() => r.request("POST", "/session/stop", undefined, undefined))).status).toBe(200);
+      const after = yield* connect(r.server.port, "/ws", undefined);
+      yield* Effect.tryPromise(() => vi.waitFor(() => expect(after.frames.length).toBeGreaterThan(0)));
+      yield* Effect.tryPromise(() => new Promise<void>((resolve) => setTimeout(resolve, 100)));
+      expect(pendingFrames(after.frames)).toEqual([]);
+    }));
+  });
+
+  // map-update-latency 4.2: 壁時計つきの origin と speaker-off を流す偽のヘルパーで、相手の発言が保留に止まらず差分更新へ届く（本物の Sessions・SessionSinks を通す）
+  it.live("壁時計つきの origin と speaker-off の後の相手の発言は、待たずに差分更新へ届く", () => Effect.gen(function* () {
+    const fresh: string[] = [];
+    const r = yield* resourceWithFakeHelpers([{ events: [
+      { type: "origin", hostTime: "1000", wallTime: Date.now() },
+      { type: "speaker-off", start: 0, reason: "モデルなし" },
+      { type: "remark", track: "相手", start: 0, end: 1, text: "待たずに届く発言" },
+    ] }], { updaterLayer: () => updaterLayer((input) => Effect.sync(() => {
+      fresh.push(...input.fresh.map((remark) => remark.text));
+      return { ops: [] };
+    })) });
+    expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"us.zoom.xos"}', undefined))).status).toBe(200);
+    yield* Effect.tryPromise(() => vi.waitFor(() => expect(fresh).toEqual(["待たずに届く発言"]), { timeout: 10_000 }));
+  }));
+
+  // map-update-latency 7.1: 偽のヘルパーでセッションを開いて閉じると、log.jsonl に origin の行（最初の wallTime だけ）と、各発言の settledAt・shownAt が残る
+  describe("計測のためのログ（map-update-latency 7.1）", () => {
+    const openAndStop = Effect.fnUntraced(function* (events: unknown[]) {
+      const fresh: string[] = [];
+      const r = yield* resourceWithFakeHelpers([{ events }], { updaterLayer: () => updaterLayer((input) => Effect.sync(() => {
+        fresh.push(...input.fresh.map((remark) => remark.text));
+        return { ops: [] };
+      })) });
+      expect((yield* Effect.tryPromise(() => r.request("POST", "/session/start", '{"app":"us.zoom.xos"}', undefined))).status).toBe(200);
+      yield* Effect.tryPromise(() => vi.waitFor(() => expect(fresh).toEqual(["ひとつめ", "ふたつめ"]), { timeout: 10_000 }));
+      expect((yield* Effect.tryPromise(() => r.request("POST", "/session/stop", undefined, undefined))).status).toBe(200);
+      const [dir] = (yield* Effect.tryPromise(() => readdir(r.sessionsDir, { withFileTypes: true }))).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+      const text = yield* Effect.tryPromise(() => readFile(join(r.sessionsDir, dir!, "log.jsonl"), "utf8"));
+      return text.split("\n").filter((l) => l !== "").map((l) => JSON.parse(l) as { type: string; wallTime?: number; at?: string; settledAt?: unknown; shownAt?: unknown });
+    });
+    const remarks = [
+      { type: "remark", track: "相手", start: 0, end: 1, text: "ひとつめ" },
+      { type: "remark", track: "相手", start: 2, end: 3, text: "ふたつめ" },
+    ];
+
+    it.live("wallTime つきの origin が起動し直しで 2 回届いても、origin の行は最初の wallTime の 1 行だけ。各発言の行に settledAt と shownAt が数値で付く", () => Effect.gen(function* () {
+      const lines = yield* openAndStop([
+        { type: "origin", hostTime: "1000", wallTime: 1760000000000 },
+        { type: "speaker-off", start: 0, reason: "モデルなし" },
+        { type: "origin", hostTime: "2000", wallTime: 1760000005000 },
+        ...remarks,
+      ]);
+      const origins = lines.filter((l) => l.type === "origin");
+      expect(origins).toHaveLength(1);
+      expect(origins[0]).toMatchObject({ wallTime: 1760000000000 });
+      expect(typeof origins[0]!.at).toBe("string");
+      const rows = lines.filter((l) => l.type === "remark");
+      expect(rows).toHaveLength(2);
+      for (const row of rows) {
+        expect(typeof row.settledAt).toBe("number");
+        expect(typeof row.shownAt).toBe("number");
+      }
+    }));
+
+    it.live("wallTime の無い origin では origin の行を書かない。発言の行の settledAt は付く", () => Effect.gen(function* () {
+      const lines = yield* openAndStop([
+        { type: "origin", hostTime: "1000" },
+        { type: "speaker-off", start: 0, reason: "モデルなし" },
+        ...remarks,
+      ]);
+      expect(lines.filter((l) => l.type === "origin")).toHaveLength(0);
+      const rows = lines.filter((l) => l.type === "remark");
+      expect(rows).toHaveLength(2);
+      for (const row of rows) expect(typeof row.settledAt).toBe("number");
+    }));
+  });
+
   // 偽の Helpers の Layer（新しい入口、CT-ENTRY-LAYERS）を使う。fake-helper.ts から attempts・listenDelayMs を
   // 削った後（CT-FAKE-TRIM）は、この 2 本を実物の子プロセスで再現できない（要件92）。期待値は変えない。
   // 1 回目（start の初回起動）は接続してから予期せず終わる（続けて失敗した回に数える）。2・3 回目の失敗で諦める

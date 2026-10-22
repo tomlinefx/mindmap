@@ -16,6 +16,7 @@ import { fakeListener } from "./fakeListener.ts";
 import { Helpers, type HelperExitInfo } from "../src/helpers.ts";
 import { SessionSinks } from "../src/sessionSinks.ts";
 import { startedServer } from "./fixtures/startedServer.ts";
+import { dataRows, isUnmeasured, rowOf } from "./fixtures/latencyTable.ts";
 import { readyHelperChecks } from "./fixtures/helperCheck.ts";
 import { fakeExportServices } from "./fixtures/exportServices.ts";
 
@@ -629,6 +630,160 @@ describe("CLI", () => {
     }));
   });
 
+  describe("latency", () => {
+    const W = 1_000_000;
+    const iso = (ms: number) => new Date(ms).toISOString();
+    // 発言 1 件を 1 回の diff で反映した、手書きのログ。callMs は呼び出しの長さ。本文は text・raw・words に入れる
+    const logWith = (text: string, callMs: number, withOrigin = true) => [
+      { type: "start", title: "会議" },
+      ...(withOrigin ? [{ type: "origin", wallTime: W, at: iso(W) }] : []),
+      { type: "remark", remark: { id: "r1", track: "自分", start: 9, end: 10, text }, raw: text, words: [{ text, start: 9, end: 10 }], settledAt: W + 10_100, shownAt: W + 10_800, at: iso(W + 10_110) },
+      { type: "diff", input: { recent: [], fresh: ["r1"], nodeCount: 0 }, ops: [], dropped: [], at: iso(W + 10_130 + callMs + 50), call: { startedAt: iso(W + 10_130), endedAt: iso(W + 10_130 + callMs) } },
+    ];
+    const writeSession = (dir: string, name: string, events: unknown[]) => {
+      const session = join(dir, name);
+      mkdirSync(session);
+      writeFileSync(join(session, "log.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+      return session;
+    };
+
+    it.effect("フォルダを渡すと、トラック × 区間の表を標準出力に出す。本文はどこにも出ない。サーバーにはつながない", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const deps = dependencies(dir);
+      const session = writeSession(dir, "2026-01-01T00-00-00.000Z", logWith("秘密の本文です", 1000));
+
+      yield* runCli(["latency", session]).pipe(Effect.provide(deps.layer));
+
+      const out = deps.stdout.join("");
+      expect(dataRows(out)).toHaveLength(12);
+      expect(rowOf(out, "自分", "call").slice(2)).toEqual(["1", "1000", "1000", "1000"]);
+      expect(rowOf(out, "自分", "shown")[2]).toBe("1");
+      expect(rowOf(out, "相手", "applied")).toSatisfy(isUnmeasured);
+      expect(out).not.toContain("秘密の本文");
+      expect(out).not.toContain("r1");
+      expect(deps.stderr).toEqual([]);
+      expect(external.openListener).not.toHaveBeenCalled();
+      expect(external.openClaudeUpdater).not.toHaveBeenCalled();
+    }));
+
+    it.effect("引数を省略すると、log.jsonl を持つ最新のセッションを集計する（ログのない、より新しいフォルダと古いセッションは使わない）", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const deps = dependencies(dir);
+      writeSession(dir, "2026-01-01T00-00-00.000Z", logWith("古い", 1000));
+      writeSession(dir, "2026-02-01T00-00-00.000Z", logWith("新しい", 2000));
+      mkdirSync(join(dir, "9999-12-31T00-00-00.000Z"));
+
+      yield* runCli(["latency"]).pipe(Effect.provide(deps.layer));
+
+      expect(rowOf(deps.stdout.join(""), "自分", "call").slice(2)).toEqual(["1", "2000", "2000", "2000"]);
+    }));
+
+    it.effect("フォルダを渡したときは、最新ではなくそのフォルダを集計する", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const deps = dependencies(dir);
+      const older = writeSession(dir, "2026-01-01T00-00-00.000Z", logWith("古い", 1000));
+      writeSession(dir, "2026-02-01T00-00-00.000Z", logWith("新しい", 2000));
+
+      yield* runCli(["latency", older]).pipe(Effect.provide(deps.layer));
+
+      expect(rowOf(deps.stdout.join(""), "自分", "call").slice(2)).toEqual(["1", "1000", "1000", "1000"]);
+    }));
+
+    it.effect("origin の行が無いログは、すべての区間を計測なしと表示して成功する（0 や NaN にしない）", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const deps = dependencies(dir);
+      const session = writeSession(dir, "2026-01-01T00-00-00.000Z", logWith("本文", 1000, false));
+
+      yield* runCli(["latency", session]).pipe(Effect.provide(deps.layer));
+
+      const out = deps.stdout.join("");
+      expect(dataRows(out)).toHaveLength(12);
+      for (const cells of dataRows(out)) expect(isUnmeasured(cells), cells.join("|")).toBe(true);
+      expect(out).not.toMatch(/NaN|undefined/);
+    }));
+
+    it.effect("本文を替えても表は同じになる", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const deps = dependencies(dir);
+      const a = writeSession(dir, "2026-01-01T00-00-00.000Z", logWith("予算の話", 1000));
+      const b = writeSession(dir, "2026-02-01T00-00-00.000Z", logWith("まったく別の長い本文".repeat(10), 1000));
+
+      yield* runCli(["latency", a]).pipe(Effect.provide(deps.layer));
+      yield* runCli(["latency", b]).pipe(Effect.provide(deps.layer));
+
+      expect(deps.stdout).toHaveLength(2);
+      expect(deps.stdout[1]).toBe(deps.stdout[0]);
+    }));
+
+    it.effect("log.jsonl が無いフォルダは、何も出さず、そのパスを含む CommandFailed で失敗する", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const deps = dependencies(dir);
+      const empty = join(dir, "空");
+      mkdirSync(empty);
+
+      const result = yield* Effect.result(runCli(["latency", empty]).pipe(Effect.provide(deps.layer)));
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isSuccess(result)) return;
+      expect(result.failure).toMatchObject({ _tag: "CommandFailed" });
+      expect((result.failure as { message: string }).message).toContain(empty);
+      expect(deps.stdout).toEqual([]);
+    }));
+
+    it.effect("引数を省略してセッションが 1 つも無ければ、何も出さず、NoSession で失敗する", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const deps = dependencies(dir);
+
+      const result = yield* Effect.result(runCli(["latency"]).pipe(Effect.provide(deps.layer)));
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isSuccess(result)) return;
+      expect(result.failure).toMatchObject({ _tag: "NoSession" });
+      expect(deps.stdout).toEqual([]);
+    }));
+
+    it.effect("ログに壊れた行があれば、何も出さず、BrokenLogLine で失敗する", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const deps = dependencies(dir);
+      const session = writeSession(dir, "2026-01-01T00-00-00.000Z", logWith("本文", 1000));
+      appendFileSync(join(session, "log.jsonl"), "{壊れた行\n");
+
+      const result = yield* Effect.result(runCli(["latency", session]).pipe(Effect.provide(deps.layer)));
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isSuccess(result)) return;
+      expect(result.failure).toMatchObject({ _tag: "BrokenLogLine" });
+      expect(deps.stdout).toEqual([]);
+    }));
+
+    it.effect("既知の種類の行で項目が壊れていれば、何も出さず、BrokenLogLine で失敗する", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const deps = dependencies(dir);
+      const events = logWith("本文", 1000).map((e) => (e.type === "remark" ? { ...e, settledAt: "あとで" } : e));
+      const session = writeSession(dir, "2026-01-01T00-00-00.000Z", events);
+
+      const result = yield* Effect.result(runCli(["latency", session]).pipe(Effect.provide(deps.layer)));
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isSuccess(result)) return;
+      expect(result.failure).toMatchObject({ _tag: "BrokenLogLine", line: 3 });
+      expect(deps.stdout).toEqual([]);
+    }));
+
+    it.effect("play（待たない再生）のログには origin の行が無く、latency はすべて計測なしと表示する", () => Effect.gen(function* () {
+      const dir = yield* temporaryDirectory;
+      const deps = dependencies(dir);
+      const { session } = yield* played(deps);
+
+      expect(readFileSync(join(session, "log.jsonl"), "utf8")).not.toContain('"type":"origin"');
+      yield* runCli(["latency", session]).pipe(Effect.provide(deps.layer));
+
+      const out = deps.stdout.join("");
+      expect(dataRows(out)).toHaveLength(12);
+      for (const cells of dataRows(out)) expect(isUnmeasured(cells), cells.join("|")).toBe(true);
+    }));
+  });
+
   describe("保存先に通常ファイルがあるとき", () => {
     it.effect("セッションと通常ファイルが混在しても、restore は最新の有効なセッションを処理する", () => Effect.gen(function* () {
       const dir = yield* temporaryDirectory;
@@ -775,9 +930,10 @@ describe("CLI", () => {
 
       yield* runCli(["play", fixture]).pipe(Effect.provide(deps.layer));
 
-      expect(n).toBe(3); // 発言 3 件が 1 件ずつ、3 回とも更新へ到達したうえで
-      expect(fake.published.map((s) => s.nodes.length)).toEqual([1, 1, 1]); // 初期のルート＋成功した 2 回（変更なし）だけ。失敗した 1 回目は送らない
-      expect(fake.published.map((s) => s.round)).toEqual([0, 1, 2]);
+      // 失敗した回の発言は順番待ちの頭へ戻り、1 秒の間隔を置いて呼び直す。再生が終わる（flush）ときは待たずに戻るので、呼び出しは失敗した 1 回だけ
+      expect(n).toBe(1); // 更新へ到達したうえで
+      expect(fake.published.map((s) => s.nodes.length)).toEqual([1]); // 初期のルートだけ。失敗した回は送らない
+      expect(fake.published.map((s) => s.round)).toEqual([0]);
     }));
 
     it.effect("再生が終わると配信を閉じる", () => Effect.gen(function* () {

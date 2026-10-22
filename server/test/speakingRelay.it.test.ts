@@ -115,7 +115,7 @@ describe("仮の文字（未反映の発言 + 途中結果）が、反映で消�
       expect(session).toBeDefined();
     }));
 
-  it.effect("反映が失敗しても、その回に渡した発言は仮の文字から消える。マップは送られない", () =>
+  it.effect("反映が失敗すると、その回に渡した発言は順番待ちの頭へ戻り、仮の文字に残る。マップは送られない", () =>
     Effect.gen(function* () {
       const { say, partial, calls, frames, unreflectedAtPublish, idle } = yield* setup();
       yield* say(remark(1, "相手", "赤")); // r1 がすぐ渡り、結果待ち
@@ -126,7 +126,7 @@ describe("仮の文字（未反映の発言 + 途中結果）が、反映で消�
       calls[0]!.reject(new Error("差分更新の失敗"));
       yield* idle();
 
-      expect(textsOf(frames, "相手").at(-1)).toEqual(["…"]);
+      expect(textsOf(frames, "相手").at(-1)).toEqual(["赤", "…"]); // r1 は処理済みにならず、未反映のまま残る
       expect(unreflectedAtPublish).toHaveLength(publishedBefore); // 失敗した反映ではマップを送らない（既存の動作）
     }));
 
