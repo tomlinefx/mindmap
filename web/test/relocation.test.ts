@@ -31,6 +31,7 @@ const stateOf = (snapshot: Snapshot, selectedId: string | null = null) => {
     parents: Object.fromEntries(shown.map((n) => [n.id, n.parent])),
     foldState: {},
     runs: {},
+    rebundles: {},
     changed: [],
     currentTopic: snapshot.currentTopic,
   };
@@ -138,6 +139,7 @@ describe("relocations: 見えている木から消えたノードの移り先", 
       parents: Object.fromEntries(shown.map((n) => [n.id, n.parent])),
       foldState: {},
       runs: {},
+      rebundles: {},
       changed: [],
       currentTopic: b.currentTopic,
     };

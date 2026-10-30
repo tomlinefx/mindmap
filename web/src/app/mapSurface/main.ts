@@ -134,6 +134,7 @@ const treeOf = (model: Model, view: FoldView | null = foldViewOf(model)): Visibl
       ? Object.fromEntries(shown.filter((n) => (n.kind === "議題" || n.kind === "論点") && !view.summaries.has(n.id)).map((n) => [n.id, n.id in view.folds ? "folded" : "open"]))
       : {},
     runs: view?.runs ?? {},
+    rebundles: view?.rebundles ?? {},
     changed: changedFocus(model.snapshot, view?.shownAs ?? {})?.ids ?? [],
     currentTopic: model.snapshot.currentTopic,
   };
@@ -436,6 +437,7 @@ export const update = (model: Model, message: Message): Return =>
       return { model: applyViewing(consumed, { type: "select", id: nodeId }), outMessage: OutMessage.SelectedNode({ nodeId }) };
     },
     ClickedFoldDot: ({ nodeId }) => ({ model: applyViewing(model, { type: "foldDot", id: nodeId }) }),
+    ClickedBundleDot: ({ nodeId }) => ({ model: applyViewing(model, { type: "bundleDot", id: nodeId }) }),
     ClickedEdgeDot: ({ nodeId }) => ({ model: applyViewing(model, { type: "edgeDot", id: nodeId }) }),
     // 「変わったこと」の項目: Snapshot にあるノードは祖先と開くかを畳む見せ方から求めて指し、無いノードは選ぶだけ（SessionView の point と同じ）。親へは知らせない
     ClickedChangeItem: ({ nodeId }) => {
@@ -489,8 +491,9 @@ const classes = (...names: ReadonlyArray<string | false>): string => names.filte
 
 type H = HtmlBuilder<Message>;
 
-// selected・toggle・opened は live のときだけ意味を持つ（still は選択も丸も描かない）。toggle は foldToggle の結果（null は開閉できない）
-function nodeBody(h: H, node: SnapshotNode, view: FoldView | null, selected: boolean, toggle: ReturnType<typeof foldToggle>, opened: boolean, speakerNames: SpeakerNames): Html {
+// selected・toggle・opened・rebundle は live のときだけ意味を持つ（still は選択も丸も描かない）。toggle は foldToggle の結果（null は開閉できない）。
+// rebundle は解いた並びの先頭か（「束ねる」丸を出す）
+function nodeBody(h: H, node: SnapshotNode, view: FoldView | null, selected: boolean, toggle: ReturnType<typeof foldToggle>, opened: boolean, rebundle: boolean, speakerNames: SpeakerNames): Html {
   const fold = view?.folds[node.id] ?? null;
   const mark = markOf(node);
   const person = personLine(node, speakerNames);
@@ -512,6 +515,7 @@ function nodeBody(h: H, node: SnapshotNode, view: FoldView | null, selected: boo
           ? h.span([h.Class("map-node__count")], [String(fold.hidden)])
           : h.button([h.Type("button"), h.Class(`map-node__count ${FOLD_DOT_CLASSES[0]}`), h.AriaLabel("開く"), h.OnClick(Message.ClickedFoldDot({ nodeId: node.id }))], [String(fold.hidden)]),
       fold === null && opened && toggle !== null ? h.button([h.Type("button"), h.Class(FOLD_DOT_CLASSES[1]), h.AriaLabel("畳む"), h.OnClick(Message.ClickedFoldDot({ nodeId: node.id }))], []) : null,
+      rebundle ? h.button([h.Type("button"), h.Class(FOLD_DOT_CLASSES[2]), h.OnClick(Message.ClickedBundleDot({ nodeId: node.id }))], ["束ねる"]) : null,
     ],
   );
 }
@@ -543,7 +547,7 @@ export const view = Submodel.defineView<Model, Message>((model, h): Html => {
         h.DataAttribute("node-id", node.id),
         h.Style({ transform: `translate(${positions[node.id]!.x}px, ${positions[node.id]!.y}px)`, width: `${NODE_WIDTH}px`, visibility: HashMap.has(model.nodeHeights, node.id) ? "visible" : "hidden" }),
       ],
-      [nodeBody(h, node, view_, node.id === selectedId, tree === null ? null : foldToggle(tree, node.id), view_ !== null && opened.has(node.id), model.speakerNames)],
+      [nodeBody(h, node, view_, node.id === selectedId, tree === null ? null : foldToggle(tree, node.id), view_ !== null && opened.has(node.id), tree !== null && tree.rebundles[node.id] !== undefined, model.speakerNames)],
     ),
   );
 

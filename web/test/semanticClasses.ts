@@ -43,6 +43,7 @@ export const SEMANTIC_CLASSES: ReadonlySet<string> = new Set([
   "map",
   "map-edges",
   "map-node",
+  "map-node__bundle-dot",
   "map-node__button",
   "map-node__count",
   "map-node__count--pressable",

@@ -279,6 +279,23 @@ describe("mapSurface の Scene: まとめのノード（議題 N 件）の丸で
       expectScene(mapNodeOf("A2")).not.toHaveClass("map-node--selected"),
     );
   });
+
+  it("解いた並びの先頭の議題だけに「束ねる」丸が出る。押すと「議題 N 件」に戻り、選んでいた A の代わりにまとめが残る", () => {
+    const bundleDotOf = (id: string) => selector(`[data-node-id="${id}"] button.map-node__bundle-dot`);
+    scene(
+      app,
+      given(measuredModel(bundled())),
+      mounted,
+      expectScene(bundleDotOf("run:A")).toBeAbsent(),
+      click(pressableCountOf("run:A")),
+      expectScene(bundleDotOf("A")).toHaveText("束ねる"),
+      expectScene(bundleDotOf("A2")).toBeAbsent(),
+      click(bundleDotOf("A")),
+      expectScene(wrapperOf("run:A")).toExist(),
+      expectScene(wrapperOf("A")).toBeAbsent(),
+      expectScene(wrapperOf("A2")).toBeAbsent(),
+    );
+  });
 });
 
 describe("mapSurface の Scene: 縁の点（画面の外で変わったノード）", () => {

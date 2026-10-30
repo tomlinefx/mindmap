@@ -18,6 +18,8 @@ export const Message = defineMessageUnion({
   ClickedNodeButton: { nodeId: Schema.String, clientX: Schema.Finite, clientY: Schema.Finite },
   // 隠れた数の丸・畳む小さな丸を押した（開閉の意味は update が reduceViewing で決める）
   ClickedFoldDot: { nodeId: Schema.String },
+  // 解いた並びの先頭の「束ねる」丸を押した（束ね直す。意味は update が reduceViewing で決める）
+  ClickedBundleDot: { nodeId: Schema.String },
   // 縁の点を押した（そのノードへ寄る。意味は update が reduceViewing で決める）
   ClickedEdgeDot: { nodeId: Schema.String },
   // 表示面の上の wheel。timeStamp はイベントの時刻（ms）。x・y はポインタの位置（表示面の左上が原点）

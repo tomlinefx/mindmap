@@ -14,7 +14,7 @@ type CameraViewing = typeof AutoCamera.Type | typeof ManualCamera.Type | typeof 
 // selection: 選んだノード（byKey: キーで選んだか）。選んでいないときはフィールドを置かない。Esc か、狭い幅のシートの閉じるボタン（deselect）で外れる
 // humanOpened・humanFolded: 人が開いた・畳んだ議題・論点（空ならフィールドを置かない。同じ ID が両方に入ることはない）。Esc でだけ全部解け、
 // 人が畳んだ議題が今の議題になると、その議題の畳みだけ解ける
-// humanUnbundled: 人が「議題 N 件」を解いたときに、そこに入っていた議題の ID（run: の ID は持たない。空ならフィールドを置かない）。Esc でだけ解ける
+// humanUnbundled: 人が「議題 N 件」を解いたときに、そこに入っていた議題の ID（run: の ID は持たない。空ならフィールドを置かない）。Esc で全部、「束ねる」丸でその並びだけ外れる
 const overlayFields = {
   keyList: Schema.optionalKey(Schema.mutableKey(Schema.Literal(true))),
   sideHidden: Schema.optionalKey(Schema.mutableKey(Schema.Literal(true))),
@@ -65,6 +65,8 @@ export type ViewingEvent =
   | { type: "enter"; meta: boolean; ctrl: boolean; alt: boolean }
   // 丸（隠れた数の丸・ホバーで出る小さな丸）を押した: 押したノードを開く・畳む
   | { type: "foldDot"; id: string }
+  // 解いた並びの先頭の「束ねる」丸を押した: その並びを「議題 N 件」に束ね直す
+  | { type: "bundleDot"; id: string }
   // 「変わったこと」の項目からノードを指した（マップのクリックの select とは別）。ancestors: 指したノードの祖先（人が畳んでいれば外して見せる）、
   // open: 指したノード自身が畳む条件に当たるか（人が開いた集合に足す）。どちらも畳む見せ方（pointedNode）が求める
   | { type: "pointChange"; id: string; ancestors: readonly string[]; open: boolean }
@@ -82,6 +84,7 @@ export type ViewingScope = "live" | "review";
 // parents: 見せるノードそれぞれの親（ルートは null）
 // foldState: 見せる議題・論点（まとめのノードを除く）が畳まれているか開いているか
 // runs: 見せるまとめのノード → そこに入っている議題（並び順）
+// rebundles: 束ね直せる並びの先頭の議題 → 並びの議題（並び順）
 // changed: 最後の反映で変わったノードの寄せ先（畳みで隠れたものは見えている代わりのノード。無ければ空）
 export type VisibleTree = {
   ids: string[];
@@ -89,6 +92,7 @@ export type VisibleTree = {
   parents: Record<string, string | null>;
   foldState: Record<string, "folded" | "open">;
   runs: Record<string, readonly string[]>;
+  rebundles: Record<string, readonly string[]>;
   changed: readonly string[];
   currentTopic: string | undefined;
 };
@@ -344,6 +348,21 @@ function reduceFoldToggle(state: ViewingState, event: Extract<ViewingEvent, { ty
   return toggleHumanFold(state, tree, id, toggle, camera);
 }
 
+// 解いた並びを束ね直す: 並びの議題を解いた集合から外す（空になればフィールドごと外す）。人が開いた集合には触れない。
+// 選んだ議題が並びにあれば、選択を束（run:先頭）へ移す（選んだ畳んだ議題は束に入らないため）。カメラは開閉と同じ
+function reduceBundleDot(state: ViewingState, event: Extract<ViewingEvent, { type: "bundleDot" }>, tree: VisibleTree): Reduced {
+  const members = tree.rebundles[event.id];
+  if (members === undefined) return { state, camera: idle(state) };
+  const left = new Set(state.humanUnbundled);
+  for (const m of members) left.delete(m);
+  const { humanUnbundled: _u, ...others } = state;
+  const next: ViewingState = left.size > 0 ? { ...others, humanUnbundled: left } : others;
+  const selected = state.selection;
+  const camera: CameraCommand = state.mode === "auto" ? REFOCUS : { type: "keepNode", id: event.id };
+  if (selected !== undefined && members.includes(selected.id)) return { state: { ...next, selection: { ...selected, id: `run:${event.id}` } }, camera };
+  return { state: next, camera };
+}
+
 function reducePointChange(state: ViewingState, event: Extract<ViewingEvent, { type: "pointChange" }>, tree: VisibleTree): Reduced {
   // 祖先の人の畳みを外し、畳む条件に当たる指したノードは人が開いた集合に足す。カメラは人の状態になり、そのノードへ寄る
   let next = state;
@@ -376,6 +395,12 @@ function reduceViaCamera(state: ViewingState, event: CameraEvent, tree: VisibleT
   return { state: withSets, camera: out.camera };
 }
 
+// キー一覧が開いている間の修飾なしの Esc は、キー一覧だけを閉じる
+function reduceEscape(state: ViewingState, event: Extract<ViewingEvent, { type: "escape" }>, tree: VisibleTree, scope: ViewingScope): Reduced {
+  if (!modified(event) && state.keyList) return { state: without(state, "keyList"), camera: idle(state) };
+  return reduceViaCamera(state, event, tree, scope);
+}
+
 // キー一覧の開閉・右の列と字幕の出し入れはカメラの状態と独立。? と、開いている間の修飾なしの Esc がキー一覧を、
 // 修飾なしの E・C が列・字幕を変える。それ以外の出来事は、重ねる状態を外した状態で reduceCamera に渡し、結果に元の重ねる状態を戻す。
 // E は列の幅だけマップが変わるので、どのモードでも shiftIntoView を出す（follow・refocus・fitAll は出さない）
@@ -399,13 +424,14 @@ export function reduceViewing(
     case "enter":
     case "foldDot":
       return reduceFoldToggle(state, event, tree);
+    case "bundleDot":
+      return reduceBundleDot(state, event, tree);
     case "pointChange":
       return reducePointChange(state, event, tree);
     case "key":
       return event.key === "Z" ? reduceFitSubtree(state, event, tree) : reduceViaCamera(state, { ...event, key: event.key }, tree, scope);
     case "escape":
-      if (!modified(event) && state.keyList) return { state: without(state, "keyList"), camera: idle(state) };
-      return reduceViaCamera(state, event, tree, scope);
+      return reduceEscape(state, event, tree, scope);
     case "userMoved":
     case "reflect":
     case "edgeDot":
@@ -415,9 +441,9 @@ export function reduceViewing(
   }
 }
 
-// reduceCamera が受ける出来事。Z（選んだノードへ寄る）、Enter・丸（開閉）、「変わったこと」から指す操作は重ねる状態に依るので、reduceViewing が先に処理して渡さない
+// reduceCamera が受ける出来事。Z（選んだノードへ寄る）、Enter・丸（開閉・束ね直し）、「変わったこと」から指す操作は重ねる状態に依るので、reduceViewing が先に処理して渡さない
 type CameraEvent =
-  | Exclude<ViewingEvent, { type: "keyList" | "side" | "captions" | "select" | "deselect" | "arrow" | "enter" | "foldDot" | "pointChange" | "key" }>
+  | Exclude<ViewingEvent, { type: "keyList" | "side" | "captions" | "select" | "deselect" | "arrow" | "enter" | "foldDot" | "bundleDot" | "pointChange" | "key" }>
   | { type: "key"; key: Exclude<ViewKey, "Z">; meta: boolean; ctrl: boolean; alt: boolean };
 
 function reduceCameraEdgeDot(state: CameraViewing, event: Extract<CameraEvent, { type: "edgeDot" }>, tree: VisibleTree): { state: CameraViewing; camera: CameraCommand } {

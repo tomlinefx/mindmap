@@ -594,6 +594,37 @@ describe("foldView: 「議題 N 件」を解いた議題（第 5 引数）と ru
   });
 });
 
+describe("foldView: 束ね直せる並び（rebundles）", () => {
+  const set = (...xs: string[]): ReadonlySet<string> => new Set(xs);
+  // 畳んだ議題 A・C・D・E が並び、話し中の B が続く
+  const nodes = () => [root, node("A", "root", "議題", done), node("C", "root", "議題", done), node("D", "root", "議題", done), node("E", "root", "議題", done), node("B", "root")];
+  const s = () => snap(nodes(), { currentTopic: "B", now: 10 });
+
+  it("解いた畳んだ議題が同じ親の下で 2 つ以上続けば、先頭の議題 → 並びの議題が入る。解いていなければ空", () => {
+    expect(foldView(s(), NONE, null, NONE, NONE).rebundles).toEqual({});
+    expect(foldView(s(), NONE, null, NONE, set("A", "C", "D", "E")).rebundles).toEqual({ A: ["A", "C", "D", "E"] });
+  });
+
+  it("人が開いた議題で並びが切れる: C を開くと、続くのは D・E だけ（A は 1 つきりで入らない）", () => {
+    expect(foldView(s(), set("C"), null, NONE, set("A", "C", "D", "E")).rebundles).toEqual({ D: ["D", "E"] });
+  });
+
+  it("解いていない畳んだ議題は並びに入らない: A・C だけ解いていれば A・C が並び、D・E は run:D にまとまったまま", () => {
+    const v = foldView(s(), NONE, null, NONE, set("A", "C"));
+    expect(v.rebundles).toEqual({ A: ["A", "C"] });
+    expect(v.runs).toEqual({ "run:D": ["D", "E"] });
+  });
+
+  it("選んだ議題も並びに入る", () => {
+    expect(foldView(s(), NONE, "C", NONE, set("A", "C", "D", "E")).rebundles).toEqual({ A: ["A", "C", "D", "E"] });
+  });
+
+  it("畳まれた親の下に隠れた並びは入らない", () => {
+    const deep = [root, node("P", "root", "議題", done), node("A", "P", "議題", done), node("C", "P", "議題", done), node("B", "root")];
+    expect(foldView(snap(deep, { currentTopic: "B", now: 10 }), NONE, null, NONE, set("A", "C")).rebundles).toEqual({});
+  });
+});
+
 describe("pointedNode: 「変わったこと」から指したノードの祖先と、人が開いた集合に足すか", () => {
   const set = (...xs: string[]): ReadonlySet<string> => new Set(xs);
   // A（済み）の下に A1（済みの論点）と決定 A1a。B が話し中。C は話し中の議題

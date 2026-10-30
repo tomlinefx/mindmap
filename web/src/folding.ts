@@ -20,6 +20,8 @@ export type FoldView = {
   shownAs: Record<string, string>;
   // まとめのノードの ID → まとめに入っている議題の ID（並び順）
   runs: Record<string, readonly string[]>;
+  // 束ね直せる並び: 同じ親の下で続く、解いた畳んだ議題（2 つ以上）の先頭の ID → 並びの議題の ID（並び順）
+  rebundles: Record<string, readonly string[]>;
 };
 
 // まとめのノード（run:X）の最初の議題の ID。まとめでなければ null
@@ -128,6 +130,26 @@ function bundleRuns(
   return bundles;
 }
 
+// 同じ親の下で続く、解いた畳んだ議題の並び（2 つ以上）。選んだ議題も入る。人が開いた議題・解いていない議題で切れる
+function rebundleRuns(nodes: readonly SnapshotNode[], index: NodeIndex, state: { folded: ReadonlySet<string>; hidden: ReadonlySet<string> }, unbundled: ReadonlySet<string>): Record<string, readonly string[]> {
+  const rebundles: Record<string, readonly string[]> = {};
+  const parents = new Set(nodes.flatMap((n) => (n.parent ? [n.parent] : [])));
+  for (const parent of parents) {
+    if (state.hidden.has(parent) || state.folded.has(parent)) continue;
+    let run: string[] = [];
+    const close = () => {
+      if (run.length >= 2) rebundles[run[0]!] = run;
+      run = [];
+    };
+    for (const kid of index.children.get(parent) ?? []) {
+      if (state.folded.has(kid.id) && kid.kind === "議題" && unbundled.has(kid.id)) run.push(kid.id);
+      else close();
+    }
+    close();
+  }
+  return rebundles;
+}
+
 function shownNodes(nodes: readonly SnapshotNode[], hidden: ReadonlySet<string>, bundles: Bundles): SnapshotNode[] {
   const shown: SnapshotNode[] = [];
   for (const n of nodes) {
@@ -175,7 +197,7 @@ function blinkOf(snapshot: Snapshot, shownIds: ReadonlySet<string>, shownAs: Rea
 // 畳む集合 =（済みの議題・論点 ∪ 15 分触れていない話し中の議題 ∪ 人が畳んだもの）−（人が開いたもの ∪ 今の議題と祖先 ∪ 選んだノードの祖先）。
 // ただし人が畳んだものは、選んだノードの祖先でも畳む（今の議題と祖先は、人が畳んでも畳まない）。
 // 選んだノード（selectedId）の祖先は畳まない（選んだノード自身は、畳む条件に当たれば畳む）。選んだ畳んだ議題は「議題 N 件」にまとめない。選んだまとめ（run:X）は X から始まるまとめとして残し、X の祖先も畳まない。
-// unbundled（人が解いた「議題 N 件」に入っていた議題）に入れた議題は、畳んだまま「議題 N 件」にまとめない
+// unbundled（人が解いた「議題 N 件」に入っていた議題）に入れた議題は、畳んだまま「議題 N 件」にまとめず、続いていれば束ね直せる並び（rebundles）にする
 export function foldView(
   snapshot: Snapshot,
   opened: ReadonlySet<string>,
@@ -208,6 +230,7 @@ export function foldView(
     blink: blinkOf(snapshot, shownIds, shownAs),
     shownAs,
     runs: bundles.runs,
+    rebundles: rebundleRuns(nodes, index, { folded, hidden }, unbundled),
   };
 }
 

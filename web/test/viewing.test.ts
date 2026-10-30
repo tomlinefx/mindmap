@@ -11,6 +11,7 @@ const tree = (currentTopic: string | undefined, changed: readonly string[] = [])
   parents: { root: null, n1: "root", n2: "root" },
   foldState: {},
   runs: {},
+  rebundles: {},
   changed,
   currentTopic,
 });
@@ -844,6 +845,7 @@ const arrowTree = (currentTopic: string | undefined, over: Partial<VisibleTree> 
   parents: { root: null, A: "root", B: "root", A1: "A", A2: "A", B1: "B" },
   foldState: {},
   runs: {},
+  rebundles: {},
   changed: [],
   currentTopic,
   ...over,
@@ -944,7 +946,7 @@ describe("reduceViewing: 選んでいないとき、または選んだノード�
   });
 
   it("選べるノードが何もないときは、何も変えない", () => {
-    const empty: VisibleTree = { ids: [], targets: {}, parents: {}, foldState: {}, runs: {}, changed: [], currentTopic: undefined };
+    const empty: VisibleTree = { ids: [], targets: {}, parents: {}, foldState: {}, runs: {}, rebundles: {}, changed: [], currentTopic: undefined };
     const out = reduceViewing(INITIAL_VIEWING, arrow("down"), empty);
     expect(out.state).toEqual({ mode: "auto" });
     expect(out.camera).toEqual({ type: "follow" });
@@ -1224,6 +1226,7 @@ const visibleOf = (
     // 見せる議題・論点（まとめのノードを除く）が、畳まれているか開いているか
     foldState: Object.fromEntries(shown.filter((n) => (n.kind === "議題" || n.kind === "論点") && !view.summaries.has(n.id)).map((n) => [n.id, n.id in view.folds ? "folded" : "open"])),
     runs: view.runs,
+    rebundles: view.rebundles,
     changed: [],
     currentTopic: snapshot.currentTopic,
   };
@@ -2023,6 +2026,56 @@ describe("reduceViewing: 解いた「議題 N 件」は反映をまたいで残�
     expect([...set0]).toEqual(["A", "D"]);
     expect(state.selection).toEqual({ id: "run:A", byKey: true });
     expect(JSON.stringify(t)).toBe(before);
+  });
+});
+
+describe("reduceViewing: 解いた議題を「束ねる」丸で束ね直す", () => {
+  const bundleDot = (id: string): ViewingEvent => ({ type: "bundleDot", id }) as ViewingEvent;
+  const unbundled: ViewingState = { mode: "manual", topic: "B", humanUnbundled: unbundledSet("A", "D") };
+
+  it("見えている木の rebundles に、解いた並びの先頭の議題 → 並びが入る", () => {
+    expect(visibleOf(runsSnap, null, NO_OPEN, NO_OPEN, unbundledSet("A", "D")).rebundles).toEqual({ A: ["A", "D"] });
+    expect(visibleOf(runsSnap, null).rebundles).toEqual({});
+  });
+
+  it("先頭の丸を押すと、並びの議題が解いた集合から外れ（空ならフィールドごと）、次の描画で run:A に戻る", () => {
+    const out = press(unbundled, bundleDot("A"), runsSnap);
+    expect("humanUnbundled" in out.state).toBe(false);
+    expect(shownIds(runsSnap, out.state)).toEqual(["root", "run:A", "B"]);
+  });
+
+  it("並びに入らない解いた議題は残る", () => {
+    const out = press({ ...unbundled, humanUnbundled: unbundledSet("A", "D", "X") }, bundleDot("A"), runsSnap);
+    expect([...unbundledOf(out.state)]).toEqual(["X"]);
+  });
+
+  it("人が開いた議題は開いたまま（人が開いた集合に触れない）", () => {
+    const nodes = [froot, fnode("A", "root", "議題", ["r1"], finished), fnode("C", "root", "議題", ["r1"], finished), fnode("D", "root", "議題", ["r1"], finished), fnode("E", "root", "議題", ["r1"], finished), fnode("B", "root", "議題", ["r1"])];
+    const snapshot = fsnap(nodes, 4, "B");
+    const from: ViewingState = { mode: "manual", topic: "B", humanOpened: set("C"), humanUnbundled: unbundledSet("A", "C", "D", "E") };
+    const out = press(from, bundleDot("D"), snapshot);
+    expect([...openedOf(out.state)]).toEqual(["C"]);
+    expect([...unbundledOf(out.state)]).toEqual(["A", "C"]);
+    expect(shownIds(snapshot, out.state)).toEqual(["root", "A", "C", "run:D", "B"]);
+  });
+
+  it("選んだ議題が並びに入っていれば、選択は束（run:先頭）へ移り、並び全体が束に戻る。入っていなければ選択はそのまま", () => {
+    const inRun = press({ ...unbundled, selection: { id: "D", byKey: true } }, bundleDot("A"), runsSnap);
+    expect(inRun.state.selection).toEqual({ id: "run:A", byKey: true });
+    expect(shownIds(runsSnap, inRun.state)).toEqual(["root", "run:A", "B"]);
+    const outside = press({ ...unbundled, selection: { id: "B", byKey: false } }, bundleDot("A"), runsSnap);
+    expect(outside.state.selection).toEqual({ id: "B", byKey: false });
+  });
+
+  it("カメラは開閉と同じ: 自動なら今の議題へ寄り直し、止めているときは先頭の議題の位置を保つ。モードは変わらない", () => {
+    expect(press({ mode: "auto", humanUnbundled: unbundledSet("A", "D") }, bundleDot("A"), runsSnap).camera).toEqual({ type: "refocus" });
+    const manual = press(unbundled, bundleDot("A"), runsSnap);
+    expect(manual.camera).toEqual({ type: "keepNode", id: "A" });
+    expect(manual.state.mode).toBe("manual");
+  });
+
+  it("並びの先頭でない議題・木に無い ID の丸は何もしない", () => {
+    for (const id of ["D", "B", "zzz"]) expect(press(unbundled, bundleDot(id), runsSnap).state).toEqual(unbundled);
   });
 });
 

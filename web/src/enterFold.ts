@@ -1,8 +1,8 @@
 // ノード本体のボタンの class 名。MapNode が付け、Enter の判定が参照する
 export const MAP_NODE_BUTTON_CLASS = "map-node__button";
 
-// 押せる丸（隠れた数の丸・畳む丸）の class 名。MapNode が付け、見返しの Space の判定が参照する
-export const FOLD_DOT_CLASSES = ["map-node__count--pressable", "map-node__fold-dot"] as const;
+// 押せる丸（隠れた数の丸・畳む丸・束ねる丸）の class 名。MapNode が付け、見返しの Space の判定が参照する
+export const FOLD_DOT_CLASSES = ["map-node__count--pressable", "map-node__fold-dot", "map-node__bundle-dot"] as const;
 
 export type Focused = { closest(selector: string): unknown } | null;
 

@@ -85,6 +85,9 @@ body { font-family: system-ui, "Hiragino Sans", sans-serif; background: var(--co
 .map-node__fold-dot { position: absolute; top: 50%; right: 6px; transform: translateY(-50%); width: 12px; height: 12px; border-radius: 50%; background: var(--color-gray-200); border: 1px solid var(--color-gray-400); box-sizing: border-box; display: block; opacity: 0; padding: 0; margin: 0; cursor: pointer; pointer-events: all; }
 .map-node:hover .map-node__fold-dot { opacity: 1; }
 .map-node__fold-dot:focus-visible { opacity: 1; outline: 2px solid #facc15; }
+/* 解いた並びの先頭の、束ねる丸: 隠れた数の丸と重ならないよう右上の縁に置き、タッチでも押せるよう常に出す。絶対配置で、ノードの実寸は変えない */
+.map-node__bundle-dot { position: absolute; top: 0; right: 6px; transform: translateY(-50%); height: 18px; padding: 0 6px; box-sizing: border-box; border-radius: 9px; background: white; border: 1px solid var(--color-gray-400); color: var(--color-gray-600); font-size: 11px; line-height: 16px; font-family: inherit; margin: 0; cursor: pointer; pointer-events: all; }
+.map-node__bundle-dot:focus-visible { outline: 2px solid #facc15; }
 
 /* 右の列・「変わったこと」の中の要素（子孫のセレクタ） */
 .evidence h2 { margin: 0 0 8px; font-size: 14px; }
